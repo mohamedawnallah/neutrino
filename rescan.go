@@ -63,8 +63,8 @@ type ChainSource interface {
 
 	// GetCFilter returns the filter of the given type for the block with
 	// the given hash.
-	GetCFilter(chainhash.Hash, wire.FilterType,
-		...QueryOption) (*gcs.Filter, error)
+	GetCFilter(chainhash.Hash,
+		wire.FilterType, ...QueryOption) (*gcs.Filter, error)
 
 	// Subscribe returns a block subscription that delivers block
 	// notifications in order. The bestHeight parameter can be used to
@@ -956,7 +956,7 @@ func (rs *rescanState) handleBlockConnected(ntfn *blockntfns.Connected) error {
 
 	// Otherwise, we'll attempt to fetch the filter to retrieve the relevant
 	// transactions and notify them.
-	queryOptions := NumRetries(0)
+	queryOptions := NumRetries(2)
 	blockFilter, err := chain.GetCFilter(
 		newStamp.Hash, wire.GCSFilterRegular, queryOptions,
 	)
@@ -1489,7 +1489,7 @@ func (r *Rescan) Update(options ...UpdateOption) error {
 			errStr += fmt.Sprintf(" It returned error: %s", r.err)
 		}
 		r.errMtx.Unlock()
-		return fmt.Errorf(errStr)
+		return errors.New(errStr)
 	}
 
 	return nil

@@ -753,7 +753,7 @@ func NewChainService(cfg Config) (*ChainService, error) {
 	if s.persistToDisk {
 		cfg := &chanutils.BatchWriterConfig[*filterdb.FilterData]{
 			QueueBufferSize:        chanutils.DefaultQueueSize,
-			MaxBatch:               1000,
+			MaxBatch:               10,
 			DBWritesTickerDuration: time.Millisecond * 500,
 			PutItems:               s.FilterDB.PutFilters,
 		}
@@ -953,8 +953,6 @@ func NewChainService(cfg Config) (*ChainService, error) {
 	}
 
 	for _, addr := range permanentPeers {
-		addr := addr
-
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
@@ -1079,6 +1077,24 @@ func (s *ChainService) BanPeer(addr string, reason banman.Reason) error {
 			addr, err)
 	}
 	return s.banStore.BanIPNet(ipNet, reason, BanDuration)
+}
+
+// UnbanPeer connects and unbans a previously banned peer.
+func (s *ChainService) UnbanPeer(addr string, parmanent bool) error {
+	log.Infof("UnBanning peer %v", addr)
+
+	ipNet, err := banman.ParseIPNet(addr, nil)
+	if err != nil {
+		return fmt.Errorf("unable to parse IP network for peer %v: %v",
+			addr, err)
+	}
+
+	err = s.banStore.UnbanIPNet(ipNet)
+	if err != nil {
+		return fmt.Errorf("unable to unban peer: %v", err)
+	}
+
+	return s.ConnectNode(addr, parmanent)
 }
 
 // IsBanned returns true if the peer is banned, and false otherwise.
