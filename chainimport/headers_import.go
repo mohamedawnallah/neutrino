@@ -736,28 +736,8 @@ type HeadersImport struct {
 }
 
 // Import is a multi-pass algorithm that loads, validates, and processes
-// headers from the configured import sources into the target header stores. The
-// Import process is currently performed only if the target stores are
-// completely empty except for gensis block/filter header otherwise it is
-// entirely skipped. On first development iteration, it is designed to serve new
-// users who don't yet have headers data, or existing users who are willing to
-// reset their headers data.
+// headers from the configured import sources into the target header stores.
 func (s *HeadersImport) Import(ctx context.Context) (*ImportResult, error) {
-	// Check first if the target header stores are fresh.
-	isFresh, err := s.isTargetFresh(
-		s.options.TargetBlockHeaderStore,
-		s.options.TargetFilterHeaderStore,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to detect if target stores "+
-			"are fresh import failed: %w", err)
-	}
-	if !isFresh {
-		log.Info("Skipping headers import: target header stores are " +
-			"not empty")
-		return &ImportResult{}, nil
-	}
-
 	// Create result structure at the beginning to capture total duration.
 	result := &ImportResult{
 		StartTime: time.Now(),
