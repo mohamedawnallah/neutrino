@@ -224,7 +224,6 @@ func TestImportOperationOnFileHeaderSource(t *testing.T) {
 					TargetBlockHeaderStore:  b,
 					TargetFilterHeaderStore: f,
 					TargetChainParams:       tCP,
-					WriteBatchSizePerRegion: 128,
 				}
 
 				return Prep{
@@ -233,11 +232,12 @@ func TestImportOperationOnFileHeaderSource(t *testing.T) {
 				}
 			},
 			verify: func(v Verify) {
-				// Verify the user write batch size is used
-				// instead of the default one.
+				// Verify the default batch size is used if no
+				// user defined batch size provided.
 				ops := v.importOptions
 				require.Equal(
-					v.tc, 128, ops.WriteBatchSizePerRegion,
+					v.tc, DefaultWriteBatchSizePerRegion,
+					ops.WriteBatchSizePerRegion,
 				)
 
 				// Verify headers added/processed excluding the
@@ -294,8 +294,9 @@ func TestImportOperationOnHTTPHeaderSource(t *testing.T) {
 		err     error
 	}
 	type Verify struct {
-		tc           *testing.T
-		importResult *ImportResult
+		tc            *testing.T
+		importOptions *ImportOptions
+		importResult  *ImportResult
 	}
 	testCases := []struct {
 		name         string
@@ -472,6 +473,13 @@ func TestImportOperationOnHTTPHeaderSource(t *testing.T) {
 				}
 			},
 			verify: func(v Verify) {
+				// Verify the default batch sized if no user
+				// defined batch size provided.
+				ops := v.importOptions
+				require.Equal(
+					v.tc, 101, ops.WriteBatchSizePerRegion,
+				)
+
 				// Verify headers added/processed excluding the
 				// genesis header.
 				require.Equal(
@@ -496,8 +504,9 @@ func TestImportOperationOnHTTPHeaderSource(t *testing.T) {
 			prep := tc.prep()
 			importResult, err := prep.hImport.Import(ctx)
 			verify := Verify{
-				tc:           t,
-				importResult: importResult,
+				tc:            t,
+				importOptions: prep.hImport.options,
+				importResult:  importResult,
 			}
 			if tc.expectErr {
 				require.ErrorContains(t, err, tc.expectErrMsg)
@@ -5190,6 +5199,357 @@ func TestHeaderStorage(t *testing.T) {
 	}
 }
 
+// TestHeaderStorageOnDivergenceHeadersRegion tests the ability of the headers
+// import process to successfully process the divergence headers region by
+// validating the leading store and syncing the lagging store.
+func TestHeaderStorageOnDivergenceHeadersRegion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	type Prep struct {
+		hImport *HeadersImport
+		cleanup func()
+		err     error
+	}
+	type Verify struct {
+		tc            *testing.T
+		importOptions *ImportOptions
+		importResult  *ImportResult
+	}
+	testCases := []struct {
+		name         string
+		region       HeaderRegion
+		importResult *ImportResult
+		prep         func() Prep
+		verify       func(Verify)
+		expectErr    bool
+		expectErrMsg string
+	}{
+		{
+			name: "NoErrorOnNonExistentRegion",
+			region: HeaderRegion{
+				Start:  1000,
+				End:    2000,
+				Exists: false,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				return Prep{
+					hImport: &HeadersImport{},
+					cleanup: func() {},
+				}
+			},
+			verify: func(Verify) {},
+		},
+		// {
+		// 	name: "ErrorOnGetChainTipForTargetBlockStore",
+		// },
+		// {
+		// 	name: "ErrorOnGetChainTipForTargetFilterStore",
+		// },
+		// {
+		// 	name: "ErrorOnMismatchHeadersWhenBlockStoreLeading",
+		// },
+		// {
+		// 	name: "ErrorOnSyncingFilterStoreWhenBlockStoreLeading",
+		// },
+		// {
+		// 	name: "ProcessDivergenceRegionWithBlockStoreLeading",
+		// },
+		// {
+		// 	name: "ErrorOnMismatchHeadersWhenFilterStoreLeading",
+		// },
+		// {
+		// 	name: "ErrorOnSyncingBlockStoreWhenFilterStoreLeading",
+		// },
+		// {
+		// 	name: "ProcessDivergenceRegionWithFilterStoreLeading",
+		// },
+		// {
+		// 	name: "ProcessDivergenceWithBlockStoreLeading",
+		// 	region: HeaderRegion{
+		// 		Start:  5,
+		// 		End:    9,
+		// 		Exists: true,
+		// 	},
+		// 	importResult: &ImportResult{},
+		// 	prep: func() Prep {
+		// 		// Create test headers for divergence region
+		// 		blockHdrs := createTestBlockHeaders(0, 9)
+		// 		filterHdrs := createTestFilterHeaders(blockHdrs)
+
+		// 		// Setup block import source with full range
+		// 		bIS := &mockHeaderImportSource{}
+		// 		bIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
+		// 			StartHeight: 0,
+		// 			EndHeight:   9,
+		// 		}, nil)
+		// 		bIS.On("GetHeaders", uint32(5), uint32(9)).Return(
+		// 			blockHdrs[5:10], nil,
+		// 		)
+
+		// 		// Setup filter import source with full range
+		// 		fIS := &mockHeaderImportSource{}
+		// 		fIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
+		// 			StartHeight: 0,
+		// 			EndHeight:   9,
+		// 		}, nil)
+		// 		fIS.On("GetHeaders", uint32(5), uint32(9)).Return(
+		// 			filterHdrs[5:10], nil,
+		// 		)
+
+		// 		// Create target stores with divergence:
+		// 		// Block store has headers 0-9, filter store has headers 0-4
+		// 		bTHS := setupInMemoryHeaderStore(blockHdrs[:10])
+		// 		fTHS := setupInMemoryFilterHeaderStore(filterHdrs[:5])
+
+		// 		// Create headers import
+		// 		h, err := NewHeadersImport(&ImportOptions{
+		// 			ImportSource:              bIS,
+		// 			FilterHeadersImportSource: fIS,
+		// 			TargetBlockHeaderStore:    bTHS,
+		// 			TargetFilterHeaderStore:   fTHS,
+		// 			Mode:                      ValidateAndAppend,
+		// 		})
+		// 		return Prep{
+		// 			hImport: h,
+		// 			cleanup: func() {},
+		// 			err:     err,
+		// 		}
+		// 	},
+		// 	verify: func(v Verify) {
+		// 		// Verify that filter headers store was synced to match block store
+		// 		_, fTipHeight, err := v.importOptions.TargetFilterHeaderStore.ChainTip()
+		// 		require.NoError(v.tc, err)
+		// 		require.Equal(v.tc, uint32(9), fTipHeight)
+
+		// 		// Verify headers are correctly stored
+		// 		for height := uint32(5); height <= 9; height++ {
+		// 			fHdr, err := v.importOptions.TargetFilterHeaderStore.FetchHeaderByHeight(height)
+		// 			require.NoError(v.tc, err)
+		// 			require.NotNil(v.tc, fHdr)
+		// 		}
+		// 	},
+		// },
+		// {
+		// 	name: "ProcessDivergenceWithFilterStoreLeading",
+		// 	region: HeaderRegion{
+		// 		Start:  5,
+		// 		End:    9,
+		// 		Exists: true,
+		// 	},
+		// 	importResult: &ImportResult{},
+		// 	prep: func() Prep {
+		// 		// Create test headers for divergence region
+		// 		blockHdrs := createTestBlockHeaders(0, 9)
+		// 		filterHdrs := createTestFilterHeaders(blockHdrs)
+
+		// 		// Setup block import source with full range
+		// 		bIS := &mockHeaderImportSource{}
+		// 		bIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
+		// 			StartHeight: 0,
+		// 			EndHeight:   9,
+		// 		}, nil)
+		// 		bIS.On("GetHeaders", uint32(5), uint32(9)).Return(
+		// 			blockHdrs[5:10], nil,
+		// 		)
+
+		// 		// Setup filter import source with full range
+		// 		fIS := &mockHeaderImportSource{}
+		// 		fIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
+		// 			StartHeight: 0,
+		// 			EndHeight:   9,
+		// 		}, nil)
+		// 		fIS.On("GetHeaders", uint32(5), uint32(9)).Return(
+		// 			filterHdrs[5:10], nil,
+		// 		)
+
+		// 		// Create target stores with divergence:
+		// 		// Block store has headers 0-4, filter store has headers 0-9
+		// 		bTHS := setupInMemoryHeaderStore(blockHdrs[:5])
+		// 		fTHS := setupInMemoryFilterHeaderStore(filterHdrs[:10])
+
+		// 		// Create headers import
+		// 		h, err := NewHeadersImport(&ImportOptions{
+		// 			ImportSource:              bIS,
+		// 			FilterHeadersImportSource: fIS,
+		// 			TargetBlockHeaderStore:    bTHS,
+		// 			TargetFilterHeaderStore:   fTHS,
+		// 			Mode:                      ValidateAndAppend,
+		// 		})
+		// 		return Prep{
+		// 			hImport: h,
+		// 			cleanup: func() {},
+		// 			err:     err,
+		// 		}
+		// 	},
+		// 	verify: func(v Verify) {
+		// 		// Verify that block headers store was synced to match filter store
+		// 		_, bTipHeight, err := v.importOptions.TargetBlockHeaderStore.ChainTip()
+		// 		require.NoError(v.tc, err)
+		// 		require.Equal(v.tc, uint32(9), bTipHeight)
+
+		// 		// Verify headers are correctly stored
+		// 		for height := uint32(5); height <= 9; height++ {
+		// 			bHdr, err := v.importOptions.TargetBlockHeaderStore.FetchHeaderByHeight(height)
+		// 			require.NoError(v.tc, err)
+		// 			require.NotNil(v.tc, bHdr)
+		// 		}
+		// 	},
+		// },
+		// {
+		// 	name: "ErrorOnHeaderValidationFailure",
+		// 	region: HeaderRegion{
+		// 		Start:  5,
+		// 		End:    7,
+		// 		Exists: true,
+		// 	},
+		// 	importResult: &ImportResult{},
+		// 	prep: func() Prep {
+		// 		// Create test headers
+		// 		blockHdrs := createTestBlockHeaders(0, 9)
+		// 		filterHdrs := createTestFilterHeaders(blockHdrs)
+
+		// 		// Create corrupted headers for import source
+		// 		corruptedBlockHdrs := make([]headerfs.BlockHeader, len(blockHdrs))
+		// 		copy(corruptedBlockHdrs, blockHdrs)
+		// 		// Corrupt header at height 6
+		// 		corruptedBlockHdrs[6].PrevHash = [32]byte{0xFF, 0xFF, 0xFF}
+
+		// 		// Setup block import source with corrupted headers
+		// 		bIS := &mockHeaderImportSource{}
+		// 		bIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
+		// 			StartHeight: 0,
+		// 			EndHeight:   9,
+		// 		}, nil)
+		// 		bIS.On("GetHeaders", uint32(5), uint32(7)).Return(
+		// 			corruptedBlockHdrs[5:8], nil,
+		// 		)
+
+		// 		// Setup filter import source
+		// 		fIS := &mockHeaderImportSource{}
+		// 		fIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
+		// 			StartHeight: 0,
+		// 			EndHeight:   9,
+		// 		}, nil)
+		// 		fIS.On("GetHeaders", uint32(5), uint32(7)).Return(
+		// 			filterHdrs[5:8], nil,
+		// 		)
+
+		// 		// Create target stores with divergence
+		// 		bTHS := setupInMemoryHeaderStore(blockHdrs[:10])
+		// 		fTHS := setupInMemoryFilterHeaderStore(filterHdrs[:5])
+
+		// 		// Create headers import
+		// 		h, err := NewHeadersImport(&ImportOptions{
+		// 			ImportSource:              bIS,
+		// 			FilterHeadersImportSource: fIS,
+		// 			TargetBlockHeaderStore:    bTHS,
+		// 			TargetFilterHeaderStore:   fTHS,
+		// 			Mode:                      ValidateAndAppend,
+		// 		})
+		// 		return Prep{
+		// 			hImport: h,
+		// 			cleanup: func() {},
+		// 			err:     err,
+		// 		}
+		// 	},
+		// 	verify: func(v Verify) {
+		// 		// Verify that filter store was not modified due to validation failure
+		// 		_, fTipHeight, err := v.importOptions.TargetFilterHeaderStore.ChainTip()
+		// 		require.NoError(v.tc, err)
+		// 		require.Equal(v.tc, uint32(4), fTipHeight)
+		// 	},
+		// 	expectErr:    true,
+		// 	expectErrMsg: "header verification failed",
+		// },
+		// {
+		// 	name: "ErrorOnImportSourceFailure",
+		// 	region: HeaderRegion{
+		// 		Start:  5,
+		// 		End:    9,
+		// 		Exists: true,
+		// 	},
+		// 	importResult: &ImportResult{},
+		// 	prep: func() Prep {
+		// 		// Create test headers
+		// 		blockHdrs := createTestBlockHeaders(0, 9)
+		// 		filterHdrs := createTestFilterHeaders(blockHdrs)
+
+		// 		// Setup block import source that returns error
+		// 		bIS := &mockHeaderImportSource{}
+		// 		bIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
+		// 			StartHeight: 0,
+		// 			EndHeight:   9,
+		// 		}, nil)
+		// 		bIS.On("GetHeaders", uint32(5), uint32(9)).Return(
+		// 			nil, fmt.Errorf("import source I/O error"),
+		// 		)
+
+		// 		// Setup filter import source
+		// 		fIS := &mockHeaderImportSource{}
+		// 		fIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
+		// 			StartHeight: 0,
+		// 			EndHeight:   9,
+		// 		}, nil)
+		// 		fIS.On("GetHeaders", uint32(5), uint32(9)).Return(
+		// 			filterHdrs[5:10], nil,
+		// 		)
+
+		// 		// Create target stores with divergence
+		// 		bTHS := setupInMemoryHeaderStore(blockHdrs[:10])
+		// 		fTHS := setupInMemoryFilterHeaderStore(filterHdrs[:5])
+
+		// 		// Create headers import
+		// 		h, err := NewHeadersImport(&ImportOptions{
+		// 			ImportSource:              bIS,
+		// 			FilterHeadersImportSource: fIS,
+		// 			TargetBlockHeaderStore:    bTHS,
+		// 			TargetFilterHeaderStore:   fTHS,
+		// 			Mode:                      ValidateAndAppend,
+		// 		})
+		// 		return Prep{
+		// 			hImport: h,
+		// 			cleanup: func() {},
+		// 			err:     err,
+		// 		}
+		// 	},
+		// 	verify: func(v Verify) {
+		// 		// Verify stores remain unchanged on error
+		// 		_, fTipHeight, err := v.importOptions.TargetFilterHeaderStore.ChainTip()
+		// 		require.NoError(v.tc, err)
+		// 		require.Equal(v.tc, uint32(4), fTipHeight)
+		// 	},
+		// 	expectErr:    true,
+		// 	expectErrMsg: "import source I/O error",
+		// },
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			prep := tc.prep()
+			t.Cleanup(prep.cleanup)
+			require.NoError(t, prep.err)
+			err := prep.hImport.processDivergenceHeadersRegion(
+				ctx, tc.region, prep.hImport.options,
+				tc.importResult,
+			)
+			verify := Verify{
+				tc:            t,
+				importOptions: prep.hImport.options,
+				importResult:  tc.importResult,
+			}
+
+			if tc.expectErr {
+				require.ErrorContains(t, err, tc.expectErrMsg)
+				tc.verify(verify)
+				return
+			}
+			require.NoError(t, err)
+			tc.verify(verify)
+		})
+	}
+}
+
 // TestHeaderStorageOnOverlapHeadersRegion tests the ability of the headers
 // import process to successfully process the overlap headers region and
 // continue synchronization from its current state.
@@ -5482,10 +5842,9 @@ func TestHeaderStorageOnOverlapHeadersRegion(t *testing.T) {
 					cleanup: cleanup,
 				}
 			},
-			verify:    func(Verify) {},
-			expectErr: true,
-			expectErrMsg: "overlap region validation failed: " +
-				"header verification failed at height 2",
+			verify:       func(Verify) {},
+			expectErr:    true,
+			expectErrMsg: "block header mismatch at height 2",
 		},
 		{
 			name: "ErrorOnInvalidFilterHeadersInOverlapRegion",
@@ -5676,11 +6035,9 @@ func TestHeaderStorageOnOverlapHeadersRegion(t *testing.T) {
 					cleanup: cleanup,
 				}
 			},
-			verify:    func(Verify) {},
-			expectErr: true,
-			expectErrMsg: "overlap region validation failed: " +
-				"header verification failed at height 2: " +
-				"filter header mismatch at height 2",
+			verify:       func(Verify) {},
+			expectErr:    true,
+			expectErrMsg: "filter header mismatch at height 2",
 		},
 		{
 			name: "ProcessOverlapRegionWithValidationWithNoErrors",
@@ -6071,7 +6428,7 @@ func TestHeaderStorageOnNewHeadersRegion(t *testing.T) {
 			name: "ErrorOnGetFilterHeader",
 			region: HeaderRegion{
 				Start:  1,
-				End:    100,
+				End:    1,
 				Exists: true,
 			},
 			importResult: &ImportResult{},
@@ -6085,7 +6442,9 @@ func TestHeaderStorageOnNewHeadersRegion(t *testing.T) {
 
 				// Mock Block iterator.
 				bIt := &mockHeaderIterator{}
-				bIt.On("Next").Return(nil, false, nil)
+				bIt.On("Next").Return(
+					NewBlockHeader(), false, nil,
+				)
 				bIt.On("Close").Return(nil)
 
 				// Mock block header iteartor.
@@ -6131,7 +6490,7 @@ func TestHeaderStorageOnNewHeadersRegion(t *testing.T) {
 			name: "ErrorOnTypeAssertingFilterHeader",
 			region: HeaderRegion{
 				Start:  1,
-				End:    100,
+				End:    1,
 				Exists: true,
 			},
 			importResult: &ImportResult{},
@@ -6145,7 +6504,9 @@ func TestHeaderStorageOnNewHeadersRegion(t *testing.T) {
 
 				// Mock Block iterator.
 				bIt := &mockHeaderIterator{}
-				bIt.On("Next").Return(nil, false, nil)
+				bIt.On("Next").Return(
+					NewBlockHeader(), false, nil,
+				)
 				bIt.On("Close").Return(nil)
 
 				// Mock block header iteartor.
@@ -6188,67 +6549,7 @@ func TestHeaderStorageOnNewHeadersRegion(t *testing.T) {
 				"*chainimport.BlockHeader",
 		},
 		{
-			name: "ErrorOnHeadersLengthMismatch",
-			region: HeaderRegion{
-				Start:  1,
-				End:    100,
-				Exists: true,
-			},
-			importResult: &ImportResult{},
-			prep: func() Prep {
-				// Mock GetHeaderMetadata on block import
-				// source.
-				bIS := &mockHeaderImportSource{}
-				bIS.On("GetHeaderMetadata").Return(
-					&HeaderMetadata{}, nil,
-				)
-
-				// Mock Block iterator.
-				bIt := &mockHeaderIterator{}
-				bIt.On("Next").Return(
-					NewBlockHeader(), false, nil,
-				)
-				bIt.On("Close").Return(nil)
-
-				// Mock block header iteartor.
-				in := mock.Anything
-				bIS.On("Iterator", in, in).Return(bIt)
-
-				// Mock filter header import source.
-				fIS := &mockHeaderImportSource{}
-
-				// Mock filter iterator.
-				fIt := &mockHeaderIterator{}
-				fIt.On("Next").Return(nil, false, nil)
-				fIt.On("Close").Return(nil)
-
-				// Mock filter header iteartor.
-				in = mock.Anything
-				fIS.On("Iterator", in, in).Return(fIt)
-
-				// Configure import options.
-				ops := &ImportOptions{
-					WriteBatchSizePerRegion: 100,
-				}
-
-				hImport := &HeadersImport{
-					BlockHeadersImportSource:  bIS,
-					FilterHeadersImportSource: fIS,
-					options:                   ops,
-				}
-
-				return Prep{
-					hImport: hImport,
-					cleanup: func() {},
-				}
-			},
-			verify:    func(Verify) {},
-			expectErr: true,
-			expectErrMsg: "mismatch between block headers (1) " +
-				"and filter headers (0) for batch 1-100",
-		},
-		{
-			name: "ErrorOnNoHeadersRead",
+			name: "ErrorOnNoBlockHeadersRead",
 			region: HeaderRegion{
 				Start:  1,
 				End:    100,
@@ -6302,7 +6603,7 @@ func TestHeaderStorageOnNewHeadersRegion(t *testing.T) {
 			},
 			verify:       func(Verify) {},
 			expectErr:    true,
-			expectErrMsg: "no headers read for batch 1-100",
+			expectErrMsg: "no block headers read for batch 1-100",
 		},
 		{
 			name: "ErrorOnWriteHeadersToTargetStores",
@@ -6349,6 +6650,9 @@ func TestHeaderStorageOnNewHeadersRegion(t *testing.T) {
 				// write error properly propagated.
 				b := &headerfs.MockBlockHeaderStore{}
 				in = mock.Anything
+				b.On("ChainTip").Return(
+					&wire.BlockHeader{}, uint32(100), nil,
+				)
 				b.On("WriteHeaders", in).Return(
 					errors.New("I/O write error"),
 				)
@@ -8157,7 +8461,9 @@ func TestImportAndTargetSourcesHeadersVerificationConstraint(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			prep := tc.prep(tc.height)
 			require.NoError(t, prep.err)
-			err := prep.hI.verifyHeadersAtTargetHeight(tc.height)
+			err := prep.hI.verifyHeadersAtTargetHeight(
+				tc.height, VerifyBlockAndFilter,
+			)
 			if tc.expectErr {
 				require.ErrorContains(t, err, tc.expectErrMsg)
 				return
