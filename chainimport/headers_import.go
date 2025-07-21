@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/neutrino/headerfs"
 	"golang.org/x/exp/mmap"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -44,6 +46,40 @@ const (
 	// size is provided.
 	DefaultWriteBatchSizePerRegion = 16384
 )
+
+// OverlapMode defines how to handle headers that overlap between the import
+// source and existing headers in the stores.
+type OverlapMode uint8
+
+const (
+	// AppendOnly adds headers only beyond what already exists in each
+	// store. If import source contains headers that overlap with existing
+	// data, it will skip those without validation and only append the new
+	// ones. This mode is optimized for performance with large header
+	// datasets from trusted sources, avoiding the overhead of additional
+	// validation between import and target sources while preserving
+	// existing data. It is the default mode as it efficiently handles
+	// imports while minimizing the risk of unintended chain
+	// reorganizations.
+	AppendOnly OverlapMode = iota
+
+	// ValidateAndAppend validates that any overlapping headers match before
+	// appending new ones. If mismatches are found during validation, the
+	// import operation is aborted.
+	ValidateAndAppend
+)
+
+// String returns a human-readable representation of the overlap mode.
+func (m OverlapMode) String() string {
+	switch m {
+	case AppendOnly:
+		return "AppendOnlyMode"
+	case ValidateAndAppend:
+		return "ValidateAndAppendMode"
+	default:
+		return fmt.Sprintf("OverlapMode(%d)", m)
+	}
+}
 
 // HeaderMetadata contains the metadata about the header source.
 type HeaderMetadata struct {
@@ -326,8 +362,8 @@ func (v *FilterHeadersImportSourceValidator) Validate(
 	iterator HeaderIterator,
 	targetChainParams chaincfg.Params) error {
 
-	log.Debug("Skipping filter headers validation - missing access to " +
-		"original compact filters")
+	log.Debug("Skipping filter headers import validation - missing " +
+		"access to original compact filters")
 	return nil
 }
 
@@ -772,7 +808,8 @@ func (s *HeadersImport) Import(ctx context.Context) (*ImportResult, error) {
 	}
 
 	// Validate all block headers from import source.
-	log.Debugf("Validating %d block headers", metadata.HeadersCount)
+	log.Debugf("Validating %d block headers from import source",
+		metadata.HeadersCount)
 	if err := s.BlockHeadersValidator.Validate(
 		s.BlockHeadersImportSource.Iterator(
 			0, metadata.HeadersCount-1,
@@ -780,11 +817,12 @@ func (s *HeadersImport) Import(ctx context.Context) (*ImportResult, error) {
 		s.options.TargetChainParams,
 	); err != nil {
 		return nil, fmt.Errorf("failed to validate block "+
-			"headers: %w", err)
+			"headers from import source: %w", err)
 	}
 
 	// Validate all filter headers from import source.
-	log.Debugf("Validating %d filter headers", metadata.HeadersCount)
+	log.Debugf("Validating %d filter headers from import source",
+		metadata.HeadersCount)
 	if err := s.FilterHeadersValidator.Validate(
 		s.FilterHeadersImportSource.Iterator(
 			0, metadata.HeadersCount-1,
@@ -792,7 +830,7 @@ func (s *HeadersImport) Import(ctx context.Context) (*ImportResult, error) {
 		s.options.TargetChainParams,
 	); err != nil {
 		return nil, fmt.Errorf("failed to validate filter "+
-			"headers: %w", err)
+			"headers from import source: %w", err)
 	}
 
 	// Determine processing regions that partition the import task into
@@ -805,9 +843,15 @@ func (s *HeadersImport) Import(ctx context.Context) (*ImportResult, error) {
 	result.StartHeight = regions.ImportStartHeight
 	result.EndHeight = regions.ImportEndHeight
 
-	// TODO(mohamedawnallah): process the overlap region. This mainly
-	// includes a validation strategy for the overlap region between headers
-	// from import and target sources.
+	// Process overlap headers region.
+	// Process headers in the overlap region by either skipping validation
+	// (AppendOnly mode) or validating that headers match exactly between
+	// import and target sources (ValidateAndAppend mode).
+	err = s.processOverlapHeadersRegion(ctx, regions.Overlap, result)
+	if err != nil {
+		return nil, fmt.Errorf("headers import failed: overlap region "+
+			"headers validation failed: %w", err)
+	}
 
 	// TODO(mohamedawnallah): Process the divergence region. This includes
 	// strategy/strategies for handling divergence region that may exist in
@@ -835,32 +879,6 @@ func (s *HeadersImport) Import(ctx context.Context) (*ImportResult, error) {
 		result.HeadersPerSecond(), result.NewHeadersPercentage())
 
 	return result, nil
-}
-
-// isTargetFresh checks if the target header stores are in their initial state,
-// meaning they contain only the genesis header (height 0).
-func (s *HeadersImport) isTargetFresh(
-	targetBlockHeaderStore headerfs.BlockHeaderStore,
-	targetFilterHeaderStore headerfs.FilterHeaderStore) (bool, error) {
-
-	// Get the chain tip from both target stores.
-	_, blockTipHeight, err := targetBlockHeaderStore.ChainTip()
-	if err != nil {
-		return false, fmt.Errorf("failed to get target block header "+
-			"chain tip: %w", err)
-	}
-
-	_, filterTipHeight, err := targetFilterHeaderStore.ChainTip()
-	if err != nil {
-		return false, fmt.Errorf("failed to get target filter header "+
-			"chain tip: %w", err)
-	}
-
-	if blockTipHeight == 0 && filterTipHeight == 0 {
-		return true, nil
-	}
-
-	return false, nil
 }
 
 // openSources initializes and opens all required header import sources. It
@@ -1301,16 +1319,131 @@ func (s *HeadersImport) verifyHeadersAtTargetHeight(height uint32) error {
 			sourceFilterHeaderHash, targetFilterHeaderHash)
 	}
 
-	log.Debugf("Headers from %s (block) and %s (filter) verified at "+
-		"height %d", s.BlockHeadersImportSource.GetURI(),
-		s.FilterHeadersImportSource.GetURI(), height)
+	log.Debugf("Headers from import sources verified at height %d", height)
+	return nil
+}
+
+// processOverlapHeadersRegion processes the headers in the overlap region by
+// either skipping validation (AppendOnly mode) or validating that headers match
+// exactly between import and target sources (ValidateAndAppend mode). When
+// using ValidateAndAppend mode, if any mismatches are found during validation,
+// the import operation is aborted.
+func (s *HeadersImport) processOverlapHeadersRegion(ctx context.Context,
+	region HeaderRegion, result *ImportResult) error {
+
+	if !region.Exists {
+		return nil
+	}
+
+	log.Infof("Validating headers in the overlap region between import "+
+		"and target sources from heights %d to %d", region.Start,
+		region.End)
+
+	switch s.options.OverlapMode {
+	case AppendOnly:
+		// Skip all headers in overlap region.
+		log.Infof("Skipping validating %d headers (block and filter) "+
+			"in overlap region due to %s mode",
+			region.End-region.Start+1, s.options.OverlapMode)
+	case ValidateAndAppend:
+		// Validate all headers in overlap region match. If mismatches
+		// are found during validation, the import operation is aborted.
+		if err := s.validateHeadersExactMatch(
+			ctx, region.Start, region.End,
+		); err != nil {
+			return fmt.Errorf("overlap region validation failed: "+
+				"%w", err)
+		}
+
+		log.Infof("Successfully validated %d headers "+
+			"(block and filter) in overlap region",
+			region.End-region.Start+1)
+	}
+
+	result.SkippedCount += int(region.End - region.Start + 1)
 
 	return nil
 }
 
-// processNewHeadersRegion imports headers from the specified region into the
-// target stores. This method handles the case where headers exist in the import
-// source but not in the target stores.
+// validateHeadersExactMatch validates all headers in the specified range match
+// exactly between import and target sources.
+//
+// The function heuristically processes sequentially for smaller ranges and uses
+// parallel validation for larger ranges to optimize performance.
+func (s *HeadersImport) validateHeadersExactMatch(ctx context.Context,
+	startHeight, endHeight uint32) error {
+
+	// Calculate the range size.
+	rangeSize := endHeight - startHeight + 1
+
+	// If range is small, heuristically process sequentially.
+	if rangeSize <= 100 {
+		return s.validateHeadersSequential(startHeight, endHeight)
+	}
+
+	// Create an errgroup with a derived context.
+	g, ctx := errgroup.WithContext(ctx)
+
+	// Set concurrency limit based on CPU cores, but cap reasonably.
+	g.SetLimit(min(runtime.NumCPU(), 8))
+
+	// Queue up all the heights to validate.
+	for height := startHeight; height <= endHeight; height++ {
+		// Add work to the errgroup.
+		g.Go(func() error {
+			// Check if context has been canceled before starting
+			// work.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
+			// Verify headers at this target height.
+			err := s.verifyHeadersAtTargetHeight(height)
+			if err != nil {
+				return fmt.Errorf("header verification failed "+
+					"at height %d: %w", height, err)
+			}
+
+			return nil
+		})
+	}
+
+	// Wait for all verification goroutines to complete or for any error.
+	err := g.Wait()
+	if err != nil {
+		return err
+	}
+
+	log.Infof("Validated %d headers in the overlap region between import "+
+		"and target sources from heights %d to %d",
+		endHeight-startHeight+1, startHeight, endHeight)
+
+	return nil
+}
+
+// validateHeadersSequential performs sequential validation for smaller ranges.
+//
+// The function validates headers sequentially for smaller ranges to optimize
+// performance.
+func (s *HeadersImport) validateHeadersSequential(startHeight,
+	endHeight uint32) error {
+
+	for height := startHeight; height <= endHeight; height++ {
+		err := s.verifyHeadersAtTargetHeight(height)
+		if err != nil {
+			return fmt.Errorf("header verification failed at "+
+				"height %d: %w", height, err)
+		}
+	}
+
+	return nil
+}
+
+// processNewHeadersRegion processes the headers in the new headers region by
+// importing them into the target stores. This method handles the case where
+// headers exist in the import source but not in the target stores.
 func (s *HeadersImport) processNewHeadersRegion(region HeaderRegion,
 	result *ImportResult) error {
 
@@ -1548,6 +1681,11 @@ type ImportOptions struct {
 	// each batch per region. This controls performance characteristics of
 	// the import.
 	WriteBatchSizePerRegion int
+
+	// OverlapMode defines how to handle headers that overlap between the
+	// import source and existing data in the target stores. Defaults to
+	// AppendOnly.
+	OverlapMode OverlapMode
 }
 
 // Import executes the header import process with the configuration specified in

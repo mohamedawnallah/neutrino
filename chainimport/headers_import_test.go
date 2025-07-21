@@ -253,7 +253,7 @@ func TestImportOperationOnFileHeaderSource(t *testing.T) {
 
 				// Verify no headers skipped.
 				require.Equal(
-					v.tc, 0, v.importResult.SkippedCount,
+					v.tc, 1, v.importResult.SkippedCount,
 				)
 			},
 		},
@@ -485,7 +485,7 @@ func TestImportOperationOnHTTPHeaderSource(t *testing.T) {
 
 				// Verify no headers skipped.
 				require.Equal(
-					v.tc, 0, v.importResult.SkippedCount,
+					v.tc, 1, v.importResult.SkippedCount,
 				)
 			},
 		},
@@ -5178,6 +5178,722 @@ func TestHeaderStorage(t *testing.T) {
 			verify := Verify{
 				tc:      t,
 				hImport: prep.hImport,
+			}
+			if tc.expectErr {
+				require.ErrorContains(t, err, tc.expectErrMsg)
+				tc.verify(verify)
+				return
+			}
+			require.NoError(t, err)
+			tc.verify(verify)
+		})
+	}
+}
+
+// TestHeaderStorageOnOverlapHeadersRegion tests the ability of the headers
+// import process to successfully process the overlap headers region and
+// continue synchronization from its current state.
+func TestHeaderStorageOnOverlapHeadersRegion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	type Prep struct {
+		hImport *HeadersImport
+		cleanup func()
+		err     error
+	}
+	type Verify struct {
+		tc            *testing.T
+		importOptions *ImportOptions
+		importResult  *ImportResult
+	}
+	testCases := []struct {
+		name         string
+		region       HeaderRegion
+		importResult *ImportResult
+		prep         func() Prep
+		verify       func(Verify)
+		expectErr    bool
+		expectErrMsg string
+	}{
+		{
+			name: "NoErrorOnNonExistentRegion",
+			region: HeaderRegion{
+				Start:  1000,
+				End:    2000,
+				Exists: false,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				return Prep{
+					hImport: &HeadersImport{},
+					cleanup: func() {},
+				}
+			},
+			verify: func(Verify) {},
+		},
+		{
+			name: "ProcessWithAppendOnlyOverlapMode",
+			region: HeaderRegion{
+				Start:  0,
+				End:    4,
+				Exists: true,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				return Prep{
+					hImport: &HeadersImport{
+						options: &ImportOptions{
+							OverlapMode: AppendOnly,
+						},
+					},
+					cleanup: func() {},
+				}
+			},
+			verify: func(v Verify) {
+				// Verify headers in the overlap region were
+				// skipped.
+				require.Equal(
+					v.tc, 5, v.importResult.SkippedCount,
+				)
+
+				// Ensure no headers are added/processed.
+				require.Equal(
+					v.tc, 0, v.importResult.AddedCount,
+				)
+				require.Equal(
+					v.tc, 0, v.importResult.ProcessedCount,
+				)
+			},
+		},
+		{
+			name: "ErrorOnGetHeaderMetadata",
+			region: HeaderRegion{
+				Start:  0,
+				End:    4,
+				Exists: true,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				// Mock GetHeaderMetadata.
+				bIS := &mockHeaderImportSource{}
+				bIS.On("GetHeaderMetadata").Return(
+					nil, errors.New("I/O read error"),
+				)
+				hImport := &HeadersImport{
+					BlockHeadersImportSource: bIS,
+					options: &ImportOptions{
+						OverlapMode: ValidateAndAppend,
+					},
+				}
+				return Prep{
+					hImport: hImport,
+					cleanup: func() {},
+				}
+			},
+			verify:       func(Verify) {},
+			expectErr:    true,
+			expectErrMsg: "I/O read error",
+		},
+		{
+			name: "ErrorOnInvalidBlockHeadersInOverlapRegion",
+			region: HeaderRegion{
+				Start:  0,
+				End:    3,
+				Exists: true,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				// Prep target header stores.
+				tempDir := t.TempDir()
+				c1 := func() {
+					os.RemoveAll(tempDir)
+				}
+
+				dbPath := filepath.Join(tempDir, "test.db")
+				db, err := walletdb.Create(
+					"bdb", dbPath, true, time.Second*10,
+				)
+				c2 := func() {
+					db.Close()
+					c1()
+				}
+				if err != nil {
+					return Prep{
+						cleanup: c2,
+						err:     err,
+					}
+				}
+
+				// Setup target block header store.
+				bHS, err := headerfs.NewBlockHeaderStore(
+					tempDir, db, &chaincfg.SimNetParams,
+				)
+				if err != nil {
+					return Prep{
+						cleanup: c2,
+						err:     err,
+					}
+				}
+
+				// Setup target filter header store.
+				fHS, err := headerfs.NewFilterHeaderStore(
+					tempDir, db, headerfs.RegularFilter,
+					&chaincfg.SimNetParams, nil,
+				)
+				if err != nil {
+					return Prep{
+						cleanup: c2,
+						err:     err,
+					}
+				}
+
+				// Prep block headers to write to the target
+				// headers store. Ignore the genesis block
+				// header since NewBlockHeaderStore already
+				// wrote it.
+				nBHs := len(blockHdrs) - 1
+				blkHdrsToWrite := make(
+					[]headerfs.BlockHeader, nBHs-1,
+				)
+				for i := 1; i < nBHs; i++ {
+					blockHdr := blockHdrs[i]
+					h, err := constructBlkHdr(
+						blockHdr, uint32(i),
+					)
+					res := Prep{
+						cleanup: c2,
+						err:     err,
+					}
+					if err != nil {
+						return res
+					}
+
+					// Deliberately and trivially malform
+					// the block header at index 2 to
+					// evaluate the validation behavior.
+					if i == 2 {
+						h.BlockHeader.Version = 101
+					}
+					bHValue := h.BlockHeader
+					blkHdrsToWrite[i-1] = bHValue
+				}
+				err = bHS.WriteHeaders(blkHdrsToWrite...)
+				require.NoError(t, err)
+
+				// Prep filter headers to write to the target
+				// headers store. Ignore the genesis filter
+				// header since NewFilterHeaderStore already
+				// wrote it.
+				nFHs := len(filterHdrs) - 1
+				filtHdrsToWrite := make(
+					[]headerfs.FilterHeader, nFHs-1,
+				)
+				for i := 1; i < nFHs; i++ {
+					filterHdr := filterHdrs[i]
+					h, err := constructFilterHdr(
+						filterHdr, uint32(i),
+					)
+					res := Prep{
+						cleanup: c2,
+						err:     err,
+					}
+					if err != nil {
+						return res
+					}
+					fH := h.FilterHeader
+					filtHdrsToWrite[i-1] = fH
+				}
+				err = fHS.WriteHeaders(filtHdrsToWrite...)
+				require.NoError(t, err)
+
+				// Create block headers import source file.
+				bFile, c3, err := setupFileWithHdrs(
+					headerfs.Block, true,
+				)
+				c4 := func() {
+					c3()
+					c2()
+				}
+				if err != nil {
+					return Prep{
+						cleanup: c4,
+						err:     err,
+					}
+				}
+				bPath := bFile.Name()
+
+				// Close block headers import source to be
+				// opened during import.
+				bFile.Close()
+
+				// Create filter headers import source file.
+				fFile, c5, err := setupFileWithHdrs(
+					headerfs.RegularFilter, true,
+				)
+				cleanup := func() {
+					c5()
+					c4()
+				}
+				if err != nil {
+					return Prep{
+						cleanup: cleanup,
+						err:     err,
+					}
+				}
+				fPath := fFile.Name()
+
+				// Close filter headers import source to be
+				// opened during import.
+				fFile.Close()
+
+				// Configure target chain parameters.
+				tCP := chaincfg.SimNetParams
+
+				overlapMode := ValidateAndAppend
+				ops := &ImportOptions{
+					BlockHeadersSource:      bPath,
+					FilterHeadersSource:     fPath,
+					TargetBlockHeaderStore:  bHS,
+					TargetFilterHeaderStore: fHS,
+					TargetChainParams:       tCP,
+					WriteBatchSizePerRegion: 128,
+					OverlapMode:             overlapMode,
+				}
+
+				bIS := ops.createBlockHeaderImportSrc()
+				fIS := ops.createFilterHeaderImportSrc()
+
+				bHV := ops.createBlockHeaderValidator()
+				fHV := ops.createFilterHeaderValidator()
+
+				hImport := &HeadersImport{
+					BlockHeadersImportSource:  bIS,
+					FilterHeadersImportSource: fIS,
+					BlockHeadersValidator:     bHV,
+					FilterHeadersValidator:    fHV,
+					options:                   ops,
+				}
+
+				err = hImport.openSources()
+				require.NoError(t, err)
+
+				return Prep{
+					hImport: hImport,
+					cleanup: cleanup,
+				}
+			},
+			verify:    func(Verify) {},
+			expectErr: true,
+			expectErrMsg: "overlap region validation failed: " +
+				"header verification failed at height 2",
+		},
+		{
+			name: "ErrorOnInvalidFilterHeadersInOverlapRegion",
+			region: HeaderRegion{
+				Start:  0,
+				End:    3,
+				Exists: true,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				// Prep target header stores.
+				tempDir := t.TempDir()
+				c1 := func() {
+					os.RemoveAll(tempDir)
+				}
+
+				dbPath := filepath.Join(tempDir, "test.db")
+				db, err := walletdb.Create(
+					"bdb", dbPath, true, time.Second*10,
+				)
+				c2 := func() {
+					db.Close()
+					c1()
+				}
+				if err != nil {
+					return Prep{
+						cleanup: c2,
+						err:     err,
+					}
+				}
+
+				// Setup target block header store.
+				bHS, err := headerfs.NewBlockHeaderStore(
+					tempDir, db, &chaincfg.SimNetParams,
+				)
+				if err != nil {
+					return Prep{
+						cleanup: c2,
+						err:     err,
+					}
+				}
+
+				// Setup target filter header store.
+				fHS, err := headerfs.NewFilterHeaderStore(
+					tempDir, db, headerfs.RegularFilter,
+					&chaincfg.SimNetParams, nil,
+				)
+				if err != nil {
+					return Prep{
+						cleanup: c2,
+						err:     err,
+					}
+				}
+
+				// Prep block headers to write to the target
+				// headers store. Ignore the genesis block
+				// header since NewBlockHeaderStore already
+				// wrote it.
+				nBHs := len(blockHdrs) - 1
+				blkHdrsToWrite := make(
+					[]headerfs.BlockHeader, nBHs-1,
+				)
+				for i := 1; i < nBHs; i++ {
+					blockHdr := blockHdrs[i]
+					h, err := constructBlkHdr(
+						blockHdr, uint32(i),
+					)
+					res := Prep{
+						cleanup: c2,
+						err:     err,
+					}
+					if err != nil {
+						return res
+					}
+					bHValue := h.BlockHeader
+					blkHdrsToWrite[i-1] = bHValue
+				}
+				err = bHS.WriteHeaders(blkHdrsToWrite...)
+				require.NoError(t, err)
+
+				// Prep filter headers to write to the target
+				// headers store. Ignore the genesis filter
+				// header since NewFilterHeaderStore already
+				// wrote it.
+				nFHs := len(filterHdrs) - 1
+				filtHdrsToWrite := make(
+					[]headerfs.FilterHeader, nFHs-1,
+				)
+				for i := 1; i < nFHs; i++ {
+					filterHdr := filterHdrs[i]
+					h, err := constructFilterHdr(
+						filterHdr, uint32(i),
+					)
+					res := Prep{
+						cleanup: c2,
+						err:     err,
+					}
+					if err != nil {
+						return res
+					}
+
+					// Deliberately and trivially malform
+					// the filter header at index 2 to
+					// evaluate the validation behavior.
+					if i == 2 {
+						invalidH := filtHdrsToWrite[i-1]
+						h.FilterHeader = invalidH
+					}
+					fH := h.FilterHeader
+					filtHdrsToWrite[i-1] = fH
+				}
+				err = fHS.WriteHeaders(filtHdrsToWrite...)
+				require.NoError(t, err)
+
+				// Create block headers import source file.
+				bFile, c3, err := setupFileWithHdrs(
+					headerfs.Block, true,
+				)
+				c4 := func() {
+					c3()
+					c2()
+				}
+				if err != nil {
+					return Prep{
+						cleanup: c4,
+						err:     err,
+					}
+				}
+				bPath := bFile.Name()
+
+				// Close block headers import source to be
+				// opened during import.
+				bFile.Close()
+
+				// Create filter headers import source file.
+				fFile, c5, err := setupFileWithHdrs(
+					headerfs.RegularFilter, true,
+				)
+				cleanup := func() {
+					c5()
+					c4()
+				}
+				if err != nil {
+					return Prep{
+						cleanup: cleanup,
+						err:     err,
+					}
+				}
+				fPath := fFile.Name()
+
+				// Close filter headers import source to be
+				// opened during import.
+				fFile.Close()
+
+				// Configure target chain parameters.
+				tCP := chaincfg.SimNetParams
+
+				overlapMode := ValidateAndAppend
+				ops := &ImportOptions{
+					BlockHeadersSource:      bPath,
+					FilterHeadersSource:     fPath,
+					TargetBlockHeaderStore:  bHS,
+					TargetFilterHeaderStore: fHS,
+					TargetChainParams:       tCP,
+					WriteBatchSizePerRegion: 128,
+					OverlapMode:             overlapMode,
+				}
+
+				bIS := ops.createBlockHeaderImportSrc()
+				fIS := ops.createFilterHeaderImportSrc()
+
+				bHV := ops.createBlockHeaderValidator()
+				fHV := ops.createFilterHeaderValidator()
+
+				hImport := &HeadersImport{
+					BlockHeadersImportSource:  bIS,
+					FilterHeadersImportSource: fIS,
+					BlockHeadersValidator:     bHV,
+					FilterHeadersValidator:    fHV,
+					options:                   ops,
+				}
+
+				err = hImport.openSources()
+				require.NoError(t, err)
+
+				return Prep{
+					hImport: hImport,
+					cleanup: cleanup,
+				}
+			},
+			verify:    func(Verify) {},
+			expectErr: true,
+			expectErrMsg: "overlap region validation failed: " +
+				"header verification failed at height 2: " +
+				"filter header mismatch at height 2",
+		},
+		{
+			name: "ProcessOverlapRegionWithValidationWithNoErrors",
+			region: HeaderRegion{
+				Start:  0,
+				End:    3,
+				Exists: true,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				// Prep target header stores.
+				tempDir := t.TempDir()
+				c1 := func() {
+					os.RemoveAll(tempDir)
+				}
+
+				dbPath := filepath.Join(tempDir, "test.db")
+				db, err := walletdb.Create(
+					"bdb", dbPath, true, time.Second*10,
+				)
+				c2 := func() {
+					db.Close()
+					c1()
+				}
+				if err != nil {
+					return Prep{
+						cleanup: c2,
+						err:     err,
+					}
+				}
+
+				// Setup target block header store.
+				bHS, err := headerfs.NewBlockHeaderStore(
+					tempDir, db, &chaincfg.SimNetParams,
+				)
+				if err != nil {
+					return Prep{
+						cleanup: c2,
+						err:     err,
+					}
+				}
+
+				// Setup target filter header store.
+				fHS, err := headerfs.NewFilterHeaderStore(
+					tempDir, db, headerfs.RegularFilter,
+					&chaincfg.SimNetParams, nil,
+				)
+				if err != nil {
+					return Prep{
+						cleanup: c2,
+						err:     err,
+					}
+				}
+
+				// Prep block headers to write to the target
+				// headers store. Ignore the genesis block
+				// header since NewBlockHeaderStore already
+				// wrote it.
+				nBHs := len(blockHdrs) - 1
+				blkHdrsToWrite := make(
+					[]headerfs.BlockHeader, nBHs-1,
+				)
+				for i := 1; i < nBHs; i++ {
+					blockHdr := blockHdrs[i]
+					h, err := constructBlkHdr(
+						blockHdr, uint32(i),
+					)
+					res := Prep{
+						cleanup: c2,
+						err:     err,
+					}
+					if err != nil {
+						return res
+					}
+					bHValue := h.BlockHeader
+					blkHdrsToWrite[i-1] = bHValue
+				}
+				err = bHS.WriteHeaders(blkHdrsToWrite...)
+				require.NoError(t, err)
+
+				// Prep filter headers to write to the target
+				// headers store. Ignore the genesis filter
+				// header since NewFilterHeaderStore already
+				// wrote it.
+				nFHs := len(filterHdrs) - 1
+				filtHdrsToWrite := make(
+					[]headerfs.FilterHeader, nFHs-1,
+				)
+				for i := 1; i < nFHs; i++ {
+					filterHdr := filterHdrs[i]
+					h, err := constructFilterHdr(
+						filterHdr, uint32(i),
+					)
+					res := Prep{
+						cleanup: c2,
+						err:     err,
+					}
+					if err != nil {
+						return res
+					}
+					fH := h.FilterHeader
+					filtHdrsToWrite[i-1] = fH
+				}
+				err = fHS.WriteHeaders(filtHdrsToWrite...)
+				require.NoError(t, err)
+
+				// Create block headers import source file.
+				bFile, c3, err := setupFileWithHdrs(
+					headerfs.Block, true,
+				)
+				c4 := func() {
+					c3()
+					c2()
+				}
+				if err != nil {
+					return Prep{
+						cleanup: c4,
+						err:     err,
+					}
+				}
+				bPath := bFile.Name()
+
+				// Close block headers import source to be
+				// opened during import.
+				bFile.Close()
+
+				// Create filter headers import source file.
+				fFile, c5, err := setupFileWithHdrs(
+					headerfs.RegularFilter, true,
+				)
+				cleanup := func() {
+					c5()
+					c4()
+				}
+				if err != nil {
+					return Prep{
+						cleanup: cleanup,
+						err:     err,
+					}
+				}
+				fPath := fFile.Name()
+
+				// Close filter headers import source to be
+				// opened during import.
+				fFile.Close()
+
+				// Configure target chain parameters.
+				tCP := chaincfg.SimNetParams
+
+				overlapMode := ValidateAndAppend
+				ops := &ImportOptions{
+					BlockHeadersSource:      bPath,
+					FilterHeadersSource:     fPath,
+					TargetBlockHeaderStore:  bHS,
+					TargetFilterHeaderStore: fHS,
+					TargetChainParams:       tCP,
+					WriteBatchSizePerRegion: 128,
+					OverlapMode:             overlapMode,
+				}
+
+				bIS := ops.createBlockHeaderImportSrc()
+				fIS := ops.createFilterHeaderImportSrc()
+
+				bHV := ops.createBlockHeaderValidator()
+				fHV := ops.createFilterHeaderValidator()
+
+				hImport := &HeadersImport{
+					BlockHeadersImportSource:  bIS,
+					FilterHeadersImportSource: fIS,
+					BlockHeadersValidator:     bHV,
+					FilterHeadersValidator:    fHV,
+					options:                   ops,
+				}
+
+				err = hImport.openSources()
+				require.NoError(t, err)
+
+				return Prep{
+					hImport: hImport,
+					cleanup: cleanup,
+				}
+			},
+			verify: func(v Verify) {
+				// Assert there are 4 headers in the overlap
+				// region and they are skipped.
+				require.Equal(
+					v.tc, len(blockHdrs)-1,
+					v.importResult.SkippedCount,
+				)
+
+				// Ensure no headers are added/processed.
+				require.Equal(
+					v.tc, 0, v.importResult.AddedCount,
+				)
+				require.Equal(
+					v.tc, 0, v.importResult.ProcessedCount,
+				)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			prep := tc.prep()
+			t.Cleanup(prep.cleanup)
+			require.NoError(t, prep.err)
+			err := prep.hImport.processOverlapHeadersRegion(
+				ctx, tc.region, tc.importResult,
+			)
+			verify := Verify{
+				tc:            t,
+				importOptions: prep.hImport.options,
+				importResult:  tc.importResult,
 			}
 			if tc.expectErr {
 				require.ErrorContains(t, err, tc.expectErrMsg)
