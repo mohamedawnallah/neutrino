@@ -48,7 +48,9 @@ const (
 )
 
 // OverlapMode defines how to handle headers that overlap between the import
-// source and existing headers in the stores.
+// source and existing headers in the stores. Regardless of the overlap mode
+// used, a sampling method is used to validate headers data in overlapping
+// ranges (if any) to ensure basic integrity.
 type OverlapMode uint8
 
 const (
@@ -110,10 +112,16 @@ const (
 type AppendMode uint8
 
 const (
+	// AppendBlockAndFilter indicates both block and filter headers should
+	// be appended during synchronization.
 	AppendBlockAndFilter AppendMode = iota
 
+	// AppendBlockOnly indicates only block headers should be appended
+	// during synchronization.
 	AppendBlockOnly
 
+	// AppendFilterOnly indicates only filter headers should be appended
+	// during synchronization.
 	AppendFilterOnly
 )
 
@@ -425,9 +433,9 @@ func NewFilterHeadersImportSourceValidator() HeadersValidator {
 	return &FilterHeadersImportSourceValidator{}
 }
 
-// ProcessingRegions currently contains regions to process. Those regions
-// overlap, divergence, and new headers region are all detected
-// but only new headers region processed.
+// ProcessingRegions contains the different processing regions for a header
+// import. The full range of headers is partitioned into overlap, divergence,
+// and new headers regions, which are all processed during an import.
 type ProcessingRegions struct {
 	// ImportStartHeight defines the starting block height for the import
 	// process.
@@ -1043,7 +1051,9 @@ func (s *HeadersImport) validateSourcesCompatibility() error {
 }
 
 // validateChainContinuity ensures that headers from import sources can be
-// properly connected to the existing headers in the target stores.
+// properly connected to the existing headers in the target stores. It uses
+// sampling method to validate headers data in overlapping ranges (if any) to
+// minimize processing time.
 func (s *HeadersImport) validateChainContinuity() error {
 	// Get metadata from block header source. We can safely use this count
 	// for both block headers and filter headers since we've already
@@ -1067,51 +1077,95 @@ func (s *HeadersImport) validateChainContinuity() error {
 			"tip: %w", err)
 	}
 
-	// Ensure that both target header stores have the same tip height.
-	// A mismatch indicates a divergence region that has not yet been
-	// processed. Once a resolution strategy is implemented, this check
-	// will no longer return an error, and the effective tip height
-	// will be defined as the minimum of the two.
+	// Take the minimum of the two heights as the effective chain tip height
+	// to handle the case where one store might be ahead in case of existent
+	// divergence region.
+	effectiveTipHeight := min(blockTipHeight, filterTipHeight)
 	if blockTipHeight != filterTipHeight {
-		return fmt.Errorf("divergence detected between target header "+
-			"store tip heights (block=%d, filter=%d)",
-			blockTipHeight, filterTipHeight)
+		log.Infof("Target header stores at different heights "+
+			"(block=%d, filter=%d), using effective tip height %d",
+			blockTipHeight, filterTipHeight, effectiveTipHeight)
 	}
 
 	// Extract import height range.
 	importStartHeight := sourceMetadata.StartHeight
 	importEndHeight := sourceMetadata.EndHeight
 
-	// If import wants to start after height 1, we'd have a gap.
-	if importStartHeight > 1 {
-		return fmt.Errorf("target stores contain only genesis block "+
-			"(height 0) but import data starts at height %d, "+
-			"creating a gap", importStartHeight)
-	}
+	switch {
+	case importStartHeight > effectiveTipHeight+1:
+		// Import data doesn't start at the next height after the target
+		// tip height, there would be a gap in the chain.
+		return fmt.Errorf("import data starts at height %d but target "+
+			"tip is at %d, creating a gap",
+			importStartHeight, effectiveTipHeight)
 
-	// If import includes genesis block (starts at 0), verify it matches.
-	if importStartHeight == 0 {
-		if err := s.verifyHeadersAtTargetHeight(
-			importStartHeight, VerifyBlockAndFilter,
-		); err != nil {
-			return fmt.Errorf("genesis header mismatch: %v", err)
-		}
-		log.Infof("Genesis headers verified, import data will extend " +
-			"chain from genesis")
-	} else {
-		// Import starts at height 1, which connects to genesis.
-		// Validate that the block header at height 1 from the import
-		// source connects with the previous header in the target block
-		// store.
+	case importStartHeight > effectiveTipHeight:
+		// Import data starts immediately after the target tip height.
+		// This is a forward extension.
 		if err := s.validateHeaderConnection(
-			importStartHeight, blockTipHeight, sourceMetadata,
+			importStartHeight, blockTipHeight,
+			sourceMetadata,
 		); err != nil {
 			return fmt.Errorf("failed to validate header "+
 				"connection: %v", err)
 		}
+		log.Infof("Import headers data will extend chain from height "+
+			"%d", importStartHeight)
 
-		log.Info("Target stores contain only genesis block, import " +
-			"data will extend chain from height 1")
+	case importStartHeight <= effectiveTipHeight:
+		// Import data starts before or at the target tip height. This
+		// means there is an overlap, so we need to verify compatibility
+		// using sampling approach for minimal processing time.
+
+		// First we need to determine the overlap range.
+		overlapStart := importStartHeight
+		overlapEnd := min(effectiveTipHeight, importEndHeight)
+
+		// Now we can verify headers at the start of the overlap range.
+		if err = s.verifyHeadersAtTargetHeight(
+			overlapStart, VerifyBlockAndFilter,
+		); err != nil {
+			return err
+		}
+
+		// If overlap range is more than 1 header, we can also verify at
+		// the end.
+		if overlapEnd > overlapStart {
+			if err = s.verifyHeadersAtTargetHeight(
+				overlapEnd, VerifyBlockAndFilter,
+			); err != nil {
+				return err
+			}
+		}
+
+		// If the overlap range is more than 2 headers, also verify at
+		// the middle point.
+		if overlapEnd-overlapStart > 2 {
+			middleHeight := (overlapStart + overlapEnd) / 2
+			if err = s.verifyHeadersAtTargetHeight(
+				middleHeight, VerifyBlockAndFilter,
+			); err != nil {
+				return err
+			}
+		}
+
+		// Validate headers beyond the overlap region if there are any
+		// remaining headers to import.
+		if overlapEnd < importEndHeight {
+			// Ensure the first header from the import source exists
+			// the overlap range properly connects to the existing
+			// chain.
+			if err := s.validateHeaderConnection(
+				overlapEnd+1, blockTipHeight,
+				sourceMetadata,
+			); err != nil {
+				return fmt.Errorf("failed to validate header "+
+					"connection: %v", err)
+			}
+		}
+
+		log.Infof("Sampling validation successful for overlap headers "+
+			"range (%d-%d)", overlapStart, overlapEnd)
 	}
 
 	log.Infof("Chain continuity validation successful: import data "+
@@ -1568,8 +1622,8 @@ func (s *HeadersImport) processDivergenceHeadersRegion(ctx context.Context,
 }
 
 // validateLeadAndSyncLag resolves divergence between target stores by
-// validating the leading store against import source and syncing the lagging
-// store with headers from the import source.
+// validating the leading target store against import source and syncing the
+// lagging target store with headers from the import source.
 func (s *HeadersImport) validateLeadAndSyncLag(ctx context.Context,
 	region HeaderRegion, options *ImportOptions) error {
 
@@ -1616,21 +1670,25 @@ func (s *HeadersImport) validateLeadAndSyncLag(ctx context.Context,
 
 // determineSyncModes determines the verification and append modes based on the
 // relative heights of block and filter header stores.
+//
+// NOTE: This is supposed to be called after divergence region has been
+// detected.
 func (s *HeadersImport) determineSyncModes(blockTipHeight,
-	filterTipHeight uint32) (SyncModes, error) {
+	filterTipHeight uint32) (*SyncModes, error) {
 
-	if blockTipHeight > filterTipHeight {
-		return SyncModes{
+	switch {
+	case blockTipHeight > filterTipHeight:
+		return &SyncModes{
 			Verify: VerifyBlockOnly,
 			Append: AppendFilterOnly,
 		}, nil
-	} else if blockTipHeight < filterTipHeight {
-		return SyncModes{
+	case blockTipHeight < filterTipHeight:
+		return &SyncModes{
 			Verify: VerifyFilterOnly,
 			Append: AppendBlockOnly,
 		}, nil
-	} else {
-		return SyncModes{}, fmt.Errorf("both header stores have "+
+	default:
+		return nil, fmt.Errorf("both header stores have "+
 			"equal height (%d) - this indicates a logic error in "+
 			"divergence detection", blockTipHeight)
 	}
@@ -1762,11 +1820,11 @@ func (s *HeadersImport) appendNewHeaders(startHeight, endHeight uint32,
 
 			for {
 				header, hasMore, err := filterIter.Next()
-				height := batchStart + uint32(len(filterHeaders))
+				h := batchStart + uint32(len(filterHeaders))
 				if err != nil {
 					return fmt.Errorf("failed to read "+
 						"filter header at height %d: "+
-						"%w", height, err)
+						"%w", h, err)
 				}
 
 				if header != nil {
@@ -1793,31 +1851,25 @@ func (s *HeadersImport) appendNewHeaders(startHeight, endHeight uint32,
 					"batch %d-%d", batchStart, batchEnd)
 			}
 
-			// Update the block header hash of the last filter
-			// header in the very last batch.
-
-			// Get the chain tip from both target stores.
-			tBHS := s.options.TargetBlockHeaderStore
-			lH, height, err := tBHS.ChainTip()
-			if err != nil {
-				return fmt.Errorf("failed to get target block "+
-					"header chain tip: %w", err)
-			}
-
 			// Check if we are in append filter only mode and
 			// this is the very last batch before updating the last
 			// header hash.
-			if appendMode == AppendFilterOnly &&
-				batchEnd+1 > endHeight {
+			isLastBatch := batchEnd+1 > endHeight
+			if appendMode == AppendFilterOnly && isLastBatch {
+				// Get the chain tip from both target stores.
+				tBHS := s.options.TargetBlockHeaderStore
+				lastH, height, err := tBHS.ChainTip()
+				if err != nil {
+					return fmt.Errorf("failed to get "+
+						"target block header chain "+
+						"tip: %w", err)
+				}
 
-				lBH := headerfs.BlockHeader{
-					BlockHeader: lH,
+				lastBH := headerfs.BlockHeader{
+					BlockHeader: lastH,
 					Height:      height,
 				}
-				blockHeaders := []headerfs.BlockHeader{lBH}
-				setLastFilterHeaderHash(
-					filterHeaders, blockHeaders,
-				)
+				setLastFilterHeaderHash(filterHeaders, lastBH)
 			}
 		}
 
@@ -1835,7 +1887,8 @@ func (s *HeadersImport) appendNewHeaders(startHeight, endHeight uint32,
 			}
 
 			// Set the filter header hash.
-			setLastFilterHeaderHash(filterHeaders, blockHeaders)
+			lastBH := blockHeaders[len(blockHeaders)-1]
+			setLastFilterHeaderHash(filterHeaders, lastBH)
 		}
 
 		// Write the headers to the target stores.
@@ -2172,13 +2225,12 @@ func AddHeadersImportMetadata(sourceFilePath string, chainType wire.BitcoinNet,
 // to match the block hash of the corresponding block header. This maintains
 // chain tip consistency for the regular tip.
 func setLastFilterHeaderHash(filterHeaders []headerfs.FilterHeader,
-	blockHeaders []headerfs.BlockHeader) {
+	chainTipBlockHeader headerfs.BlockHeader) {
 
 	// We only need to set the block header hash of the last filter
 	// header to maintain chain tip consistency for regular tip.
-	lastIdx := len(filterHeaders) - 1
-	chainTipHash := blockHeaders[lastIdx].BlockHeader.BlockHash()
-	filterHeaders[lastIdx].HeaderHash = chainTipHash
+	chainTipHash := chainTipBlockHeader.BlockHeader.BlockHash()
+	filterHeaders[len(filterHeaders)-1].HeaderHash = chainTipHash
 }
 
 // targetHeightToImportSourceIndex converts the absolute blockchain target

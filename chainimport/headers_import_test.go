@@ -4581,6 +4581,95 @@ func TestHeaderProcessing(t *testing.T) {
 	}
 }
 
+// TestHeaderSyncing tests the determineSyncModes method to ensure it correctly
+// determines sync modes based on block and filter tip heights.
+func TestHeaderSyncing(t *testing.T) {
+	t.Parallel()
+	type Verify struct {
+		tc        *testing.T
+		syncModes *SyncModes
+	}
+	testCases := []struct {
+		name            string
+		blockTipHeight  uint32
+		filterTipHeight uint32
+		verify          func(Verify)
+		expectErr       bool
+		expectErrMsg    string
+	}{
+		{
+			name:            "ErrorOnEqualHeights",
+			blockTipHeight:  100,
+			filterTipHeight: 100,
+			verify:          func(Verify) {},
+			expectErr:       true,
+			expectErrMsg: "both header stores have equal height " +
+				"(100) - this indicates a logic error in " +
+				"divergence detection",
+		},
+		{
+			name:            "BlockTipHigherThanFilterTip",
+			blockTipHeight:  100,
+			filterTipHeight: 50,
+			verify: func(v Verify) {
+				// Assert that the verify mode is verifying
+				// block headers only in the leading store
+				require.Equal(
+					v.tc, VerifyBlockOnly,
+					v.syncModes.Verify,
+				)
+
+				// Assert that the append mode is appending
+				// filter headers only to the lagging store.
+				require.Equal(
+					v.tc, AppendFilterOnly,
+					v.syncModes.Append,
+				)
+			},
+		},
+		{
+			name:            "FilterTipHigherThanBlockTip",
+			blockTipHeight:  50,
+			filterTipHeight: 100,
+			verify: func(v Verify) {
+				// Assert that the verify mode is verifying
+				// filter headers only in the leading store
+				require.Equal(
+					v.tc, VerifyFilterOnly,
+					v.syncModes.Verify,
+				)
+
+				// Assert that the append mode is appending
+				// block headers only to the lagging store.
+				require.Equal(
+					v.tc, AppendBlockOnly,
+					v.syncModes.Append,
+				)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			hImport := &HeadersImport{}
+			syncModes, err := hImport.determineSyncModes(
+				tc.blockTipHeight, tc.filterTipHeight,
+			)
+			verify := Verify{
+				tc:        t,
+				syncModes: syncModes,
+			}
+			if tc.expectErr {
+				require.ErrorContains(t, err, tc.expectErrMsg)
+				tc.verify(verify)
+				return
+			}
+			require.NoError(t, err)
+			tc.verify(verify)
+		})
+	}
+}
+
 // TestHeaderStorage tests the header storage to the target header stores.
 // It checks that the headers are written correctly to the target header stores.
 func TestHeaderStorage(t *testing.T) {
@@ -4908,9 +4997,8 @@ func TestHeaderStorage(t *testing.T) {
 					filtHdrsToWrite[i-1] = fH
 				}
 
-				setLastFilterHeaderHash(
-					filtHdrsToWrite, blkHdrsToWrite,
-				)
+				lastBH := blkHdrsToWrite[len(blkHdrsToWrite)-1]
+				setLastFilterHeaderHash(filtHdrsToWrite, lastBH)
 
 				// Configure import options.
 				ops := &ImportOptions{
@@ -5240,288 +5328,917 @@ func TestHeaderStorageOnDivergenceHeadersRegion(t *testing.T) {
 			},
 			verify: func(Verify) {},
 		},
-		// {
-		// 	name: "ErrorOnGetChainTipForTargetBlockStore",
-		// },
-		// {
-		// 	name: "ErrorOnGetChainTipForTargetFilterStore",
-		// },
-		// {
-		// 	name: "ErrorOnMismatchHeadersWhenBlockStoreLeading",
-		// },
-		// {
-		// 	name: "ErrorOnSyncingFilterStoreWhenBlockStoreLeading",
-		// },
-		// {
-		// 	name: "ProcessDivergenceRegionWithBlockStoreLeading",
-		// },
-		// {
-		// 	name: "ErrorOnMismatchHeadersWhenFilterStoreLeading",
-		// },
-		// {
-		// 	name: "ErrorOnSyncingBlockStoreWhenFilterStoreLeading",
-		// },
-		// {
-		// 	name: "ProcessDivergenceRegionWithFilterStoreLeading",
-		// },
-		// {
-		// 	name: "ProcessDivergenceWithBlockStoreLeading",
-		// 	region: HeaderRegion{
-		// 		Start:  5,
-		// 		End:    9,
-		// 		Exists: true,
-		// 	},
-		// 	importResult: &ImportResult{},
-		// 	prep: func() Prep {
-		// 		// Create test headers for divergence region
-		// 		blockHdrs := createTestBlockHeaders(0, 9)
-		// 		filterHdrs := createTestFilterHeaders(blockHdrs)
+		{
+			name: "ErrorOnGetChainTipForTargetBlockStore",
+			region: HeaderRegion{
+				Start:  1,
+				End:    4,
+				Exists: true,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				// Mock target block header store.
+				bHS := &headerfs.MockBlockHeaderStore{}
+				bHS.On("ChainTip").Return(
+					&wire.BlockHeader{}, uint32(0),
+					errors.New("I/O read error"),
+				)
 
-		// 		// Setup block import source with full range
-		// 		bIS := &mockHeaderImportSource{}
-		// 		bIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
-		// 			StartHeight: 0,
-		// 			EndHeight:   9,
-		// 		}, nil)
-		// 		bIS.On("GetHeaders", uint32(5), uint32(9)).Return(
-		// 			blockHdrs[5:10], nil,
-		// 		)
+				// Configure Import options.
+				ops := &ImportOptions{
+					TargetBlockHeaderStore: bHS,
+				}
 
-		// 		// Setup filter import source with full range
-		// 		fIS := &mockHeaderImportSource{}
-		// 		fIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
-		// 			StartHeight: 0,
-		// 			EndHeight:   9,
-		// 		}, nil)
-		// 		fIS.On("GetHeaders", uint32(5), uint32(9)).Return(
-		// 			filterHdrs[5:10], nil,
-		// 		)
+				hImport := &HeadersImport{
+					options: ops,
+				}
 
-		// 		// Create target stores with divergence:
-		// 		// Block store has headers 0-9, filter store has headers 0-4
-		// 		bTHS := setupInMemoryHeaderStore(blockHdrs[:10])
-		// 		fTHS := setupInMemoryFilterHeaderStore(filterHdrs[:5])
+				return Prep{
+					hImport: hImport,
+					cleanup: func() {},
+				}
+			},
+			verify:    func(Verify) {},
+			expectErr: true,
+			expectErrMsg: "failed to get target block header " +
+				"chain tip: I/O read error",
+		},
+		{
+			name: "ErrorOnGetChainTipForTargetFilterStore",
+			region: HeaderRegion{
+				Start:  1,
+				End:    4,
+				Exists: true,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				// Mock target block header store.
+				bHS := &headerfs.MockBlockHeaderStore{}
+				bHS.On("ChainTip").Return(
+					&wire.BlockHeader{}, uint32(0), nil,
+				)
 
-		// 		// Create headers import
-		// 		h, err := NewHeadersImport(&ImportOptions{
-		// 			ImportSource:              bIS,
-		// 			FilterHeadersImportSource: fIS,
-		// 			TargetBlockHeaderStore:    bTHS,
-		// 			TargetFilterHeaderStore:   fTHS,
-		// 			Mode:                      ValidateAndAppend,
-		// 		})
-		// 		return Prep{
-		// 			hImport: h,
-		// 			cleanup: func() {},
-		// 			err:     err,
-		// 		}
-		// 	},
-		// 	verify: func(v Verify) {
-		// 		// Verify that filter headers store was synced to match block store
-		// 		_, fTipHeight, err := v.importOptions.TargetFilterHeaderStore.ChainTip()
-		// 		require.NoError(v.tc, err)
-		// 		require.Equal(v.tc, uint32(9), fTipHeight)
+				// Mock target filter header store.
+				fHS := &headerfs.MockFilterHeaderStore{}
+				fHS.On("ChainTip").Return(
+					&chainhash.Hash{}, uint32(0),
+					errors.New("I/O read error"),
+				)
 
-		// 		// Verify headers are correctly stored
-		// 		for height := uint32(5); height <= 9; height++ {
-		// 			fHdr, err := v.importOptions.TargetFilterHeaderStore.FetchHeaderByHeight(height)
-		// 			require.NoError(v.tc, err)
-		// 			require.NotNil(v.tc, fHdr)
-		// 		}
-		// 	},
-		// },
-		// {
-		// 	name: "ProcessDivergenceWithFilterStoreLeading",
-		// 	region: HeaderRegion{
-		// 		Start:  5,
-		// 		End:    9,
-		// 		Exists: true,
-		// 	},
-		// 	importResult: &ImportResult{},
-		// 	prep: func() Prep {
-		// 		// Create test headers for divergence region
-		// 		blockHdrs := createTestBlockHeaders(0, 9)
-		// 		filterHdrs := createTestFilterHeaders(blockHdrs)
+				// Configure Import options.
+				ops := &ImportOptions{
+					TargetBlockHeaderStore:  bHS,
+					TargetFilterHeaderStore: fHS,
+				}
 
-		// 		// Setup block import source with full range
-		// 		bIS := &mockHeaderImportSource{}
-		// 		bIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
-		// 			StartHeight: 0,
-		// 			EndHeight:   9,
-		// 		}, nil)
-		// 		bIS.On("GetHeaders", uint32(5), uint32(9)).Return(
-		// 			blockHdrs[5:10], nil,
-		// 		)
+				hImport := &HeadersImport{
+					options: ops,
+				}
 
-		// 		// Setup filter import source with full range
-		// 		fIS := &mockHeaderImportSource{}
-		// 		fIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
-		// 			StartHeight: 0,
-		// 			EndHeight:   9,
-		// 		}, nil)
-		// 		fIS.On("GetHeaders", uint32(5), uint32(9)).Return(
-		// 			filterHdrs[5:10], nil,
-		// 		)
+				return Prep{
+					hImport: hImport,
+					cleanup: func() {},
+				}
+			},
+			verify:    func(Verify) {},
+			expectErr: true,
+			expectErrMsg: "failed to get target filter header " +
+				"chain tip: I/O read error",
+		},
+		{
+			name: "ErrorOnDeterminingSyncModes",
+			region: HeaderRegion{
+				Start:  1,
+				End:    4,
+				Exists: true,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				// Mock target block header store.
+				bHS := &headerfs.MockBlockHeaderStore{}
+				bHS.On("ChainTip").Return(
+					&wire.BlockHeader{}, uint32(0), nil,
+				)
 
-		// 		// Create target stores with divergence:
-		// 		// Block store has headers 0-4, filter store has headers 0-9
-		// 		bTHS := setupInMemoryHeaderStore(blockHdrs[:5])
-		// 		fTHS := setupInMemoryFilterHeaderStore(filterHdrs[:10])
+				// Mock target filter header store.
+				fHS := &headerfs.MockFilterHeaderStore{}
+				fHS.On("ChainTip").Return(
+					&chainhash.Hash{}, uint32(0), nil,
+				)
 
-		// 		// Create headers import
-		// 		h, err := NewHeadersImport(&ImportOptions{
-		// 			ImportSource:              bIS,
-		// 			FilterHeadersImportSource: fIS,
-		// 			TargetBlockHeaderStore:    bTHS,
-		// 			TargetFilterHeaderStore:   fTHS,
-		// 			Mode:                      ValidateAndAppend,
-		// 		})
-		// 		return Prep{
-		// 			hImport: h,
-		// 			cleanup: func() {},
-		// 			err:     err,
-		// 		}
-		// 	},
-		// 	verify: func(v Verify) {
-		// 		// Verify that block headers store was synced to match filter store
-		// 		_, bTipHeight, err := v.importOptions.TargetBlockHeaderStore.ChainTip()
-		// 		require.NoError(v.tc, err)
-		// 		require.Equal(v.tc, uint32(9), bTipHeight)
+				// Configure Import options.
+				ops := &ImportOptions{
+					TargetBlockHeaderStore:  bHS,
+					TargetFilterHeaderStore: fHS,
+				}
 
-		// 		// Verify headers are correctly stored
-		// 		for height := uint32(5); height <= 9; height++ {
-		// 			bHdr, err := v.importOptions.TargetBlockHeaderStore.FetchHeaderByHeight(height)
-		// 			require.NoError(v.tc, err)
-		// 			require.NotNil(v.tc, bHdr)
-		// 		}
-		// 	},
-		// },
-		// {
-		// 	name: "ErrorOnHeaderValidationFailure",
-		// 	region: HeaderRegion{
-		// 		Start:  5,
-		// 		End:    7,
-		// 		Exists: true,
-		// 	},
-		// 	importResult: &ImportResult{},
-		// 	prep: func() Prep {
-		// 		// Create test headers
-		// 		blockHdrs := createTestBlockHeaders(0, 9)
-		// 		filterHdrs := createTestFilterHeaders(blockHdrs)
+				hImport := &HeadersImport{
+					options: ops,
+				}
 
-		// 		// Create corrupted headers for import source
-		// 		corruptedBlockHdrs := make([]headerfs.BlockHeader, len(blockHdrs))
-		// 		copy(corruptedBlockHdrs, blockHdrs)
-		// 		// Corrupt header at height 6
-		// 		corruptedBlockHdrs[6].PrevHash = [32]byte{0xFF, 0xFF, 0xFF}
+				return Prep{
+					hImport: hImport,
+					cleanup: func() {},
+				}
+			},
+			verify:    func(Verify) {},
+			expectErr: true,
+			expectErrMsg: "both header stores have equal height " +
+				"(0) - this indicates a logic error in " +
+				"divergence detection",
+		},
+		{
+			name: "ErrorOnMismatchHeadersWhenBlockStoreLeading",
+			region: HeaderRegion{
+				Start:  1,
+				End:    4,
+				Exists: true,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				// Mock target block header store.
+				bHS := &headerfs.MockBlockHeaderStore{}
+				bHS.On("ChainTip").Return(
+					&wire.BlockHeader{}, uint32(4), nil,
+				)
 
-		// 		// Setup block import source with corrupted headers
-		// 		bIS := &mockHeaderImportSource{}
-		// 		bIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
-		// 			StartHeight: 0,
-		// 			EndHeight:   9,
-		// 		}, nil)
-		// 		bIS.On("GetHeaders", uint32(5), uint32(7)).Return(
-		// 			corruptedBlockHdrs[5:8], nil,
-		// 		)
+				// Mock target filter header store.
+				fHS := &headerfs.MockFilterHeaderStore{}
+				fHS.On("ChainTip").Return(
+					&chainhash.Hash{}, uint32(0), nil,
+				)
 
-		// 		// Setup filter import source
-		// 		fIS := &mockHeaderImportSource{}
-		// 		fIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
-		// 			StartHeight: 0,
-		// 			EndHeight:   9,
-		// 		}, nil)
-		// 		fIS.On("GetHeaders", uint32(5), uint32(7)).Return(
-		// 			filterHdrs[5:8], nil,
-		// 		)
+				// Mock block header import store.
+				bIS := &mockHeaderImportSource{}
+				bM := &HeaderMetadata{
+					HeaderType:       headerfs.Block,
+					BitcoinChainType: wire.SimNet,
+					StartHeight:      1,
+				}
+				bIS.On("GetHeaderMetadata").Return(bM, nil)
 
-		// 		// Create target stores with divergence
-		// 		bTHS := setupInMemoryHeaderStore(blockHdrs[:10])
-		// 		fTHS := setupInMemoryFilterHeaderStore(filterHdrs[:5])
+				// Mock block headers import source and target
+				// store on Block Headers Retrieval.
+				numBlockHeaders := len(blockHdrs)
+				midpointHeight := uint32(numBlockHeaders) / 2
+				for i := 1; i < numBlockHeaders; i++ {
+					height := uint32(i)
+					blockHeader := blockHdrs[i]
 
-		// 		// Create headers import
-		// 		h, err := NewHeadersImport(&ImportOptions{
-		// 			ImportSource:              bIS,
-		// 			FilterHeadersImportSource: fIS,
-		// 			TargetBlockHeaderStore:    bTHS,
-		// 			TargetFilterHeaderStore:   fTHS,
-		// 			Mode:                      ValidateAndAppend,
-		// 		})
-		// 		return Prep{
-		// 			hImport: h,
-		// 			cleanup: func() {},
-		// 			err:     err,
-		// 		}
-		// 	},
-		// 	verify: func(v Verify) {
-		// 		// Verify that filter store was not modified due to validation failure
-		// 		_, fTipHeight, err := v.importOptions.TargetFilterHeaderStore.ChainTip()
-		// 		require.NoError(v.tc, err)
-		// 		require.Equal(v.tc, uint32(4), fTipHeight)
-		// 	},
-		// 	expectErr:    true,
-		// 	expectErrMsg: "header verification failed",
-		// },
-		// {
-		// 	name: "ErrorOnImportSourceFailure",
-		// 	region: HeaderRegion{
-		// 		Start:  5,
-		// 		End:    9,
-		// 		Exists: true,
-		// 	},
-		// 	importResult: &ImportResult{},
-		// 	prep: func() Prep {
-		// 		// Create test headers
-		// 		blockHdrs := createTestBlockHeaders(0, 9)
-		// 		filterHdrs := createTestFilterHeaders(blockHdrs)
+					newHeader, err := constructBlkHdr(
+						blockHeader, height,
+					)
+					if err != nil {
+						return Prep{
+							cleanup: func() {},
+							err:     err,
+						}
+					}
 
-		// 		// Setup block import source that returns error
-		// 		bIS := &mockHeaderImportSource{}
-		// 		bIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
-		// 			StartHeight: 0,
-		// 			EndHeight:   9,
-		// 		}, nil)
-		// 		bIS.On("GetHeaders", uint32(5), uint32(9)).Return(
-		// 			nil, fmt.Errorf("import source I/O error"),
-		// 		)
+					bIS.On("GetHeader", height-1).Return(
+						newHeader, nil,
+					).Once()
 
-		// 		// Setup filter import source
-		// 		fIS := &mockHeaderImportSource{}
-		// 		fIS.On("GetHeaderMetadata").Return(&HeaderMetadata{
-		// 			StartHeight: 0,
-		// 			EndHeight:   9,
-		// 		}, nil)
-		// 		fIS.On("GetHeaders", uint32(5), uint32(9)).Return(
-		// 			filterHdrs[5:10], nil,
-		// 		)
+					bH := newHeader.BlockHeader
+					if height != midpointHeight {
+						bHS.On(
+							"FetchHeaderByHeight",
+							height,
+						).Return(
+							bH.BlockHeader, nil,
+						).Once()
+					} else {
+						// Use invalid block header at
+						// midpoint for leading block
+						// header store to trigger
+						// validation failure.
+						nH := NewBlockHeader()
+						nBH := nH.(*BlockHeader)
+						bH := nBH.BlockHeader
+						bHS.On(
+							"FetchHeaderByHeight",
+							height,
+						).Return(
+							bH.BlockHeader, nil,
+						).Once()
+					}
+				}
 
-		// 		// Create target stores with divergence
-		// 		bTHS := setupInMemoryHeaderStore(blockHdrs[:10])
-		// 		fTHS := setupInMemoryFilterHeaderStore(filterHdrs[:5])
+				// Configure Import options.
+				ops := &ImportOptions{
+					TargetBlockHeaderStore:  bHS,
+					TargetFilterHeaderStore: fHS,
+				}
 
-		// 		// Create headers import
-		// 		h, err := NewHeadersImport(&ImportOptions{
-		// 			ImportSource:              bIS,
-		// 			FilterHeadersImportSource: fIS,
-		// 			TargetBlockHeaderStore:    bTHS,
-		// 			TargetFilterHeaderStore:   fTHS,
-		// 			Mode:                      ValidateAndAppend,
-		// 		})
-		// 		return Prep{
-		// 			hImport: h,
-		// 			cleanup: func() {},
-		// 			err:     err,
-		// 		}
-		// 	},
-		// 	verify: func(v Verify) {
-		// 		// Verify stores remain unchanged on error
-		// 		_, fTipHeight, err := v.importOptions.TargetFilterHeaderStore.ChainTip()
-		// 		require.NoError(v.tc, err)
-		// 		require.Equal(v.tc, uint32(4), fTipHeight)
-		// 	},
-		// 	expectErr:    true,
-		// 	expectErrMsg: "import source I/O error",
-		// },
+				hImport := &HeadersImport{
+					BlockHeadersImportSource: bIS,
+					options:                  ops,
+				}
+
+				return Prep{
+					hImport: hImport,
+					cleanup: func() {},
+				}
+			},
+			verify:       func(Verify) {},
+			expectErr:    true,
+			expectErrMsg: "block header mismatch at height 2",
+		},
+		{
+			name: "ErrorOnSyncingFilterStoreWhenBlockStoreLeading",
+			region: HeaderRegion{
+				Start:  1,
+				End:    4,
+				Exists: true,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				// Mock target block header store.
+				bHS := &headerfs.MockBlockHeaderStore{}
+				bHS.On("ChainTip").Return(
+					&wire.BlockHeader{}, uint32(4), nil,
+				)
+
+				// Mock target filter header store.
+				fHS := &headerfs.MockFilterHeaderStore{}
+				fHS.On("ChainTip").Return(
+					&chainhash.Hash{}, uint32(0), nil,
+				)
+
+				// Mock block header import store.
+				bIS := &mockHeaderImportSource{}
+				bM := &HeaderMetadata{
+					HeaderType:       headerfs.Block,
+					BitcoinChainType: wire.SimNet,
+					StartHeight:      1,
+				}
+				bIS.On("GetHeaderMetadata").Return(bM, nil)
+
+				// Mock block headers import source and target
+				// store on Block Headers Retrieval.
+				numBlockHeaders := len(blockHdrs)
+				for i := 1; i < numBlockHeaders; i++ {
+					height := uint32(i)
+					blockHeader := blockHdrs[i]
+
+					nHdr, err := constructBlkHdr(
+						blockHeader, height,
+					)
+					if err != nil {
+						return Prep{
+							cleanup: func() {},
+							err:     err,
+						}
+					}
+
+					bIS.On("GetHeader", height-1).Return(
+						nHdr, nil,
+					).Once()
+
+					bHS.On(
+						"FetchHeaderByHeight", height,
+					).Return(
+						nHdr.BlockHeader.BlockHeader,
+						nil,
+					).Once()
+				}
+
+				// Mock filter header import store.
+				fIS := &mockHeaderImportSource{}
+
+				// Mock filter iterator.
+				fIt := &mockHeaderIterator{}
+				fIt.On("Next").Return(
+					nil, true, errors.New("I/O read error"),
+				).Once()
+				fIt.On("Close").Return(nil)
+
+				// Mock filter header iteartor.
+				in := mock.Anything
+				fIS.On("Iterator", in, in).Return(fIt)
+
+				// Configure Import options.
+				ops := &ImportOptions{
+					TargetBlockHeaderStore:  bHS,
+					TargetFilterHeaderStore: fHS,
+				}
+
+				hImport := &HeadersImport{
+					BlockHeadersImportSource:  bIS,
+					FilterHeadersImportSource: fIS,
+					options:                   ops,
+				}
+
+				return Prep{
+					hImport: hImport,
+					cleanup: func() {},
+				}
+			},
+			verify:    func(Verify) {},
+			expectErr: true,
+			expectErrMsg: "failed to sync target header store: " +
+				"failed to read filter header at height 1: " +
+				"I/O read error",
+		},
+		{
+			name: "ValidateLeadBlockStoreAndSyncLagFilterStore",
+			region: HeaderRegion{
+				Start:  1,
+				End:    4,
+				Exists: true,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				// Prep target header stores.
+				tempDir := t.TempDir()
+				c1 := func() {
+					os.RemoveAll(tempDir)
+				}
+
+				dbPath := filepath.Join(tempDir, "test.db")
+				db, err := walletdb.Create(
+					"bdb", dbPath, true, time.Second*10,
+				)
+				cleanup := func() {
+					db.Close()
+					c1()
+				}
+				if err != nil {
+					return Prep{
+						cleanup: cleanup,
+						err:     err,
+					}
+				}
+
+				// Setup target block header store.
+				bHS, err := headerfs.NewBlockHeaderStore(
+					tempDir, db, &chaincfg.SimNetParams,
+				)
+				if err != nil {
+					return Prep{
+						cleanup: cleanup,
+						err:     err,
+					}
+				}
+
+				// Setup target filter header store.
+				fHS, err := headerfs.NewFilterHeaderStore(
+					tempDir, db, headerfs.RegularFilter,
+					&chaincfg.SimNetParams, nil,
+				)
+				if err != nil {
+					return Prep{
+						cleanup: cleanup,
+						err:     err,
+					}
+				}
+
+				// Prep block headers to write to the target
+				// headers store to be considered the lead.
+				// Ignore the genesis block header since
+				// NewBlockHeaderStore already wrote it.
+				nBHs := len(blockHdrs)
+				blkHdrsToWrite := make(
+					[]headerfs.BlockHeader, nBHs-1,
+				)
+				for i := 1; i < nBHs; i++ {
+					blockHdr := blockHdrs[i]
+					h, err := constructBlkHdr(
+						blockHdr, uint32(i),
+					)
+					res := Prep{
+						cleanup: cleanup,
+						err:     err,
+					}
+					if err != nil {
+						return res
+					}
+					bHValue := h.BlockHeader
+					blkHdrsToWrite[i-1] = bHValue
+				}
+				err = bHS.WriteHeaders(blkHdrsToWrite...)
+				require.NoError(t, err)
+
+				// Mock block header import store.
+				bIS := &mockHeaderImportSource{}
+				bM := &HeaderMetadata{
+					HeaderType:       headerfs.Block,
+					BitcoinChainType: wire.SimNet,
+					StartHeight:      1,
+				}
+				bIS.On("GetHeaderMetadata").Return(bM, nil)
+
+				// Mock block headers import source on Block
+				// Headers Retrieval.
+				numBlockHeaders := len(blockHdrs)
+				for i := 1; i < numBlockHeaders; i++ {
+					bH, err := constructBlkHdr(
+						blockHdrs[i], uint32(i),
+					)
+					if err != nil {
+						return Prep{
+							cleanup: cleanup,
+							err:     err,
+						}
+					}
+					bIS.On("GetHeader", uint32(i-1)).Return(
+						bH, nil,
+					).Once()
+				}
+
+				// Mock filter header import store.
+				fIS := &mockHeaderImportSource{}
+
+				// Mock filter iterator.
+				fIt := &mockHeaderIterator{}
+				fIt.On("Close").Return(nil)
+
+				// Mock filter headers import source on Filter
+				// Headers Retrieval.
+				numFilterHeaders := len(filterHdrs)
+				for i := 1; i < numFilterHeaders; i++ {
+					fH, err := constructFilterHdr(
+						filterHdrs[i], uint32(i),
+					)
+					if err != nil {
+						return Prep{
+							cleanup: cleanup,
+							err:     err,
+						}
+					}
+					// For all headers except the last one.
+					if i < numFilterHeaders-1 {
+						fIt.On("Next").Return(
+							fH, true, nil,
+						).Once()
+					} else {
+						// For the last header, indicate
+						// end of iteration.
+						fIt.On("Next").Return(
+							fH, false, nil,
+						)
+					}
+				}
+
+				// Mock filter header iteartor.
+				in := mock.Anything
+				fIS.On("Iterator", in, in).Return(fIt)
+
+				// Configure Import options.
+				ops := &ImportOptions{
+					TargetBlockHeaderStore:  bHS,
+					TargetFilterHeaderStore: fHS,
+					WriteBatchSizePerRegion: 128,
+				}
+
+				hImport := &HeadersImport{
+					BlockHeadersImportSource:  bIS,
+					FilterHeadersImportSource: fIS,
+					options:                   ops,
+				}
+
+				return Prep{
+					hImport: hImport,
+					cleanup: cleanup,
+				}
+			},
+			verify: func(v Verify) {
+				// Ensure divergence headers are processed and
+				// added.
+				nH := len(filterHdrs)
+				require.Equal(
+					v.tc, nH-1, v.importResult.AddedCount,
+				)
+				require.Equal(
+					v.tc, nH-1,
+					v.importResult.ProcessedCount,
+				)
+
+				// Verify no headers in the overlap region
+				// because of divergence.
+				require.Equal(
+					v.tc, 0, v.importResult.SkippedCount,
+				)
+
+				// Verify chain tip of the target filter header
+				// store.
+				options := v.importOptions
+				tFS := options.TargetFilterHeaderStore
+				chainTipF, height, err := tFS.ChainTip()
+				require.NoError(v.tc, err)
+
+				// Verify that the target filter header store
+				// synced with filter header import store.
+				require.Equal(v.tc, uint32(nH-1), height)
+
+				// Assert that the known filter header at this
+				// index matches the retrieved one.
+				chainTipFEx, err := constructFilterHdr(
+					filterHdrs[nH-1], uint32(nH-1),
+				)
+				require.NoError(v.tc, err)
+				b := &chainTipFEx.FilterHash
+				require.Equal(v.tc, b, chainTipF)
+			},
+		},
+		{
+			name: "ErrorOnMismatchHeadersWhenFilterStoreLeading",
+			region: HeaderRegion{
+				Start:  1,
+				End:    4,
+				Exists: true,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				// Mock target block header store.
+				bHS := &headerfs.MockBlockHeaderStore{}
+				bHS.On("ChainTip").Return(
+					&wire.BlockHeader{}, uint32(0), nil,
+				)
+
+				// Mock target filter header store.
+				fHS := &headerfs.MockFilterHeaderStore{}
+				fHS.On("ChainTip").Return(
+					&chainhash.Hash{}, uint32(4), nil,
+				)
+
+				// Mock block header import store.
+				bIS := &mockHeaderImportSource{}
+				bM := &HeaderMetadata{
+					HeaderType:       headerfs.Block,
+					BitcoinChainType: wire.SimNet,
+					StartHeight:      1,
+				}
+				bIS.On("GetHeaderMetadata").Return(bM, nil)
+
+				// Mock filter header import store.
+				fIS := &mockHeaderImportSource{}
+
+				// Mock filter headers import source and target
+				// store on Filter Headers Retrieval.
+				numFilterHeaders := len(filterHdrs)
+				midpointHeight := uint32(numFilterHeaders) / 2
+				for i := 1; i < numFilterHeaders; i++ {
+					height := uint32(i)
+					filterHeader := filterHdrs[i]
+
+					newHeader, err := constructFilterHdr(
+						filterHeader, height,
+					)
+					if err != nil {
+						return Prep{
+							cleanup: func() {},
+							err:     err,
+						}
+					}
+
+					fIS.On("GetHeader", height-1).Return(
+						newHeader, nil,
+					).Once()
+
+					fH := newHeader.FilterHash
+					if height != midpointHeight {
+						fHS.On(
+							"FetchHeaderByHeight",
+							height,
+						).Return(&fH, nil).Once()
+					} else {
+						// Use invalid filter header at
+						// midpoint for leading filter
+						// header store to trigger
+						// validation failure.
+						nH := NewFilterHeader()
+						nFH := nH.(*FilterHeader)
+						fH := nFH.FilterHash
+						fHS.On(
+							"FetchHeaderByHeight",
+							height,
+						).Return(&fH, nil).Once()
+					}
+				}
+
+				// Configure Import options.
+				ops := &ImportOptions{
+					TargetBlockHeaderStore:  bHS,
+					TargetFilterHeaderStore: fHS,
+				}
+
+				hImport := &HeadersImport{
+					BlockHeadersImportSource:  bIS,
+					FilterHeadersImportSource: fIS,
+					options:                   ops,
+				}
+
+				return Prep{
+					hImport: hImport,
+					cleanup: func() {},
+				}
+			},
+			verify:       func(Verify) {},
+			expectErr:    true,
+			expectErrMsg: "filter header mismatch at height 2",
+		},
+		{
+			name: "ErrorOnSyncingBlockStoreWhenFilterStoreLeading",
+			region: HeaderRegion{
+				Start:  1,
+				End:    4,
+				Exists: true,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				// Mock target block header store.
+				bHS := &headerfs.MockBlockHeaderStore{}
+				bHS.On("ChainTip").Return(
+					&wire.BlockHeader{}, uint32(0), nil,
+				)
+
+				// Mock target filter header store.
+				fHS := &headerfs.MockFilterHeaderStore{}
+				fHS.On("ChainTip").Return(
+					&chainhash.Hash{}, uint32(4), nil,
+				)
+
+				// Mock block header import store.
+				bIS := &mockHeaderImportSource{}
+				bM := &HeaderMetadata{
+					HeaderType:       headerfs.Block,
+					BitcoinChainType: wire.SimNet,
+					StartHeight:      1,
+				}
+				bIS.On("GetHeaderMetadata").Return(bM, nil)
+
+				// Mock filter header import store.
+				fIS := &mockHeaderImportSource{}
+
+				// Mock filter headers import source and target
+				// store on Filter Headers Retrieval.
+				numFilterHeaders := len(filterHdrs)
+				for i := 1; i < numFilterHeaders; i++ {
+					height := uint32(i)
+					filterHeader := filterHdrs[i]
+
+					newHeader, err := constructFilterHdr(
+						filterHeader, height,
+					)
+					if err != nil {
+						return Prep{
+							cleanup: func() {},
+							err:     err,
+						}
+					}
+
+					fIS.On("GetHeader", height-1).Return(
+						newHeader, nil,
+					).Once()
+
+					fHS.On(
+						"FetchHeaderByHeight", height,
+					).Return(
+						&newHeader.FilterHash, nil,
+					).Once()
+				}
+
+				// Mock filter iterator.
+				bIT := &mockHeaderIterator{}
+				bIT.On("Next").Return(
+					nil, true, errors.New("I/O read error"),
+				).Once()
+				bIT.On("Close").Return(nil)
+
+				// Mock block header iteartor.
+				in := mock.Anything
+				bIS.On("Iterator", in, in).Return(bIT)
+
+				// Configure Import options.
+				ops := &ImportOptions{
+					TargetBlockHeaderStore:  bHS,
+					TargetFilterHeaderStore: fHS,
+				}
+
+				hImport := &HeadersImport{
+					BlockHeadersImportSource:  bIS,
+					FilterHeadersImportSource: fIS,
+					options:                   ops,
+				}
+
+				return Prep{
+					hImport: hImport,
+					cleanup: func() {},
+				}
+			},
+			verify:    func(Verify) {},
+			expectErr: true,
+			expectErrMsg: "failed to sync target header store: " +
+				"failed to read block header at height 1: " +
+				"I/O read error",
+		},
+		{
+			name: "ValidateLeadFilterStoreAndSyncLagBlockStore",
+			region: HeaderRegion{
+				Start:  1,
+				End:    4,
+				Exists: true,
+			},
+			importResult: &ImportResult{},
+			prep: func() Prep {
+				// Prep target header stores.
+				tempDir := t.TempDir()
+				c1 := func() {
+					os.RemoveAll(tempDir)
+				}
+
+				dbPath := filepath.Join(tempDir, "test.db")
+				db, err := walletdb.Create(
+					"bdb", dbPath, true, time.Second*10,
+				)
+				cleanup := func() {
+					db.Close()
+					c1()
+				}
+				if err != nil {
+					return Prep{
+						cleanup: cleanup,
+						err:     err,
+					}
+				}
+
+				// Setup target block header store.
+				bHS, err := headerfs.NewBlockHeaderStore(
+					tempDir, db, &chaincfg.SimNetParams,
+				)
+				if err != nil {
+					return Prep{
+						cleanup: cleanup,
+						err:     err,
+					}
+				}
+
+				// Mock target filter header store to avoid
+				// "target height not found in index" when
+				// leading the filter header store over block
+				// header store.
+				fHS := &headerfs.MockFilterHeaderStore{}
+				fHS.On("ChainTip").Return(
+					&chainhash.Hash{},
+					uint32(len(blockHdrs)-1), nil,
+				)
+
+				// Mock target filter header stores on headers.
+				nFHs := len(filterHdrs)
+				for i := range nFHs {
+					height := uint32(i)
+					filterHdr := filterHdrs[i]
+					h, err := constructFilterHdr(
+						filterHdr, height,
+					)
+					res := Prep{
+						cleanup: cleanup,
+						err:     err,
+					}
+					if err != nil {
+						return res
+					}
+
+					fHS.On(
+						"FetchHeaderByHeight", height,
+					).Return(
+						&h.FilterHash, nil,
+					).Once()
+				}
+
+				// Mock target filter header store on write
+				// headers.
+				fHS.On("WriteHeaders", mock.Anything).Return(
+					nil,
+				)
+
+				// Mock filter header import store.
+				fIS := &mockHeaderImportSource{}
+
+				// Mock filter headers import source and target
+				// store on Filter Headers Retrieval.
+				numFilterHeaders := len(filterHdrs)
+				for i := 1; i < numFilterHeaders; i++ {
+					height := uint32(i)
+					filterHeader := filterHdrs[i]
+
+					newHeader, err := constructFilterHdr(
+						filterHeader, height,
+					)
+					if err != nil {
+						return Prep{
+							cleanup: cleanup,
+							err:     err,
+						}
+					}
+
+					fIS.On("GetHeader", height-1).Return(
+						newHeader, nil,
+					).Once()
+				}
+
+				// Mock block header import store.
+				bIS := &mockHeaderImportSource{}
+				bM := &HeaderMetadata{
+					HeaderType:       headerfs.Block,
+					BitcoinChainType: wire.SimNet,
+					StartHeight:      1,
+				}
+				bIS.On("GetHeaderMetadata").Return(bM, nil)
+
+				// Mock block iterator.
+				bIt := &mockHeaderIterator{}
+				bIt.On("Close").Return(nil)
+
+				// Mock block headers import source on Block
+				// Headers Retrieval.
+				numBlockHeaders := len(blockHdrs)
+				for i := 1; i < numBlockHeaders; i++ {
+					bH, err := constructBlkHdr(
+						blockHdrs[i], uint32(i),
+					)
+					if err != nil {
+						return Prep{
+							cleanup: cleanup,
+							err:     err,
+						}
+					}
+					// For all headers except the last one.
+					if i < numBlockHeaders-1 {
+						bIt.On("Next").Return(
+							bH, true, nil,
+						).Once()
+					} else {
+						// For the last header, indicate
+						// end of iteration.
+						bIt.On("Next").Return(
+							bH, false, nil,
+						)
+					}
+				}
+
+				// Mock filter header iteartor.
+				in := mock.Anything
+				bIS.On("Iterator", in, in).Return(bIt)
+
+				// Configure Import options.
+				ops := &ImportOptions{
+					TargetBlockHeaderStore:  bHS,
+					TargetFilterHeaderStore: fHS,
+					WriteBatchSizePerRegion: 128,
+				}
+
+				hImport := &HeadersImport{
+					BlockHeadersImportSource:  bIS,
+					FilterHeadersImportSource: fIS,
+					options:                   ops,
+				}
+
+				return Prep{
+					hImport: hImport,
+					cleanup: cleanup,
+				}
+			},
+			verify: func(v Verify) {
+				// Ensure divergence headers are processed and
+				// added.
+				nH := len(blockHdrs)
+				require.Equal(
+					v.tc, nH-1, v.importResult.AddedCount,
+				)
+				require.Equal(
+					v.tc, nH-1,
+					v.importResult.ProcessedCount,
+				)
+
+				// Verify no headers in the overlap region
+				// because of divergence.
+				require.Equal(
+					v.tc, 0, v.importResult.SkippedCount,
+				)
+
+				// Verify chain tip of the target block header
+				// store.
+				options := v.importOptions
+				tBS := options.TargetBlockHeaderStore
+				chainTipB, height, err := tBS.ChainTip()
+				require.NoError(v.tc, err)
+
+				// Verify that the target block header store
+				// synced with block header import store.
+				require.Equal(v.tc, uint32(nH-1), height)
+
+				// Assert that the known block header at this
+				// index matches the retrieved one.
+				chainTipBEx, err := constructBlkHdr(
+					blockHdrs[nH-1], uint32(nH-1),
+				)
+				require.NoError(v.tc, err)
+				b := chainTipBEx.BlockHeader.BlockHeader
+				require.Equal(v.tc, b, chainTipB)
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -5538,7 +6255,6 @@ func TestHeaderStorageOnDivergenceHeadersRegion(t *testing.T) {
 				importOptions: prep.hImport.options,
 				importResult:  tc.importResult,
 			}
-
 			if tc.expectErr {
 				require.ErrorContains(t, err, tc.expectErrMsg)
 				tc.verify(verify)
@@ -5711,7 +6427,7 @@ func TestHeaderStorageOnOverlapHeadersRegion(t *testing.T) {
 				// headers store. Ignore the genesis block
 				// header since NewBlockHeaderStore already
 				// wrote it.
-				nBHs := len(blockHdrs) - 1
+				nBHs := len(blockHdrs)
 				blkHdrsToWrite := make(
 					[]headerfs.BlockHeader, nBHs-1,
 				)
@@ -5903,7 +6619,7 @@ func TestHeaderStorageOnOverlapHeadersRegion(t *testing.T) {
 				// headers store. Ignore the genesis block
 				// header since NewBlockHeaderStore already
 				// wrote it.
-				nBHs := len(blockHdrs) - 1
+				nBHs := len(blockHdrs)
 				blkHdrsToWrite := make(
 					[]headerfs.BlockHeader, nBHs-1,
 				)
@@ -6096,7 +6812,7 @@ func TestHeaderStorageOnOverlapHeadersRegion(t *testing.T) {
 				// headers store. Ignore the genesis block
 				// header since NewBlockHeaderStore already
 				// wrote it.
-				nBHs := len(blockHdrs) - 1
+				nBHs := len(blockHdrs)
 				blkHdrsToWrite := make(
 					[]headerfs.BlockHeader, nBHs-1,
 				)
@@ -7362,46 +8078,6 @@ func TestImportAndTargetSourcesChainContinuityConstraint(t *testing.T) {
 				"chain tip: I/O read error",
 		},
 		{
-			name: "ErrorOnDivergenceInTargetHeaderStores",
-			prep: func() Prep {
-				// Mock block import source.
-				bIS := &mockHeaderImportSource{}
-				bIS.On("GetHeaderMetadata").Return(
-					&HeaderMetadata{}, nil,
-				)
-
-				// Mock target block header store.
-				bHS := &headerfs.MockBlockHeaderStore{}
-				bHS.On("ChainTip").Return(
-					&wire.BlockHeader{}, uint32(0), nil,
-				)
-
-				// Mock target filter header store.
-				fHS := &headerfs.MockFilterHeaderStore{}
-				fHS.On("ChainTip").Return(
-					&chainhash.Hash{}, uint32(2), nil,
-				)
-
-				// Configure Import options.
-				ops := &ImportOptions{
-					TargetBlockHeaderStore:  bHS,
-					TargetFilterHeaderStore: fHS,
-				}
-
-				h := &HeadersImport{
-					BlockHeadersImportSource: bIS,
-					options:                  ops,
-				}
-
-				return Prep{
-					hImport: h,
-				}
-			},
-			expectErr: true,
-			expectErrMsg: "divergence detected between target " +
-				"header store tip heights (block=0, filter=2)",
-		},
-		{
 			name: "ErrorOnImportStartHeightCreatesGap",
 			prep: func() Prep {
 				// Mock block import source.
@@ -7441,117 +8117,96 @@ func TestImportAndTargetSourcesChainContinuityConstraint(t *testing.T) {
 				}
 			},
 			expectErr: true,
-			expectErrMsg: "target stores contain only genesis " +
-				"block (height 0) but import data starts at " +
-				"height 2, creating a gap",
+			expectErrMsg: "import data starts at height 2 but " +
+				"target tip is at 0, creating a gap",
 		},
 		{
-			name: "ErrorOnGenesisBlockHeadersMismatch",
+			name: "ErrorOnMiddleBlockHeadersMismatch",
 			prep: func() Prep {
-				// Prep block header for testing.
-				bH, err := constructBlkHdr(
-					blockHdrs[0],
-					uint32(0),
-				)
-				if err != nil {
-					return Prep{err: err}
-				}
-
 				// Mock block import source.
+				hM := &HeaderMetadata{
+					StartHeight: 0,
+					EndHeight:   uint32(len(blockHdrs) - 1),
+				}
 				bIS := &mockHeaderImportSource{}
-				bIS.On("GetHeaderMetadata").Return(
-					&HeaderMetadata{}, nil,
-				)
-				bIS.On("GetHeader", uint32(0)).Return(
-					NewBlockHeader(), nil,
-				)
+				bIS.On("GetHeaderMetadata").Return(hM, nil)
 
 				// Mock target block header store.
 				bHS := &headerfs.MockBlockHeaderStore{}
 				bHS.On("ChainTip").Return(
-					&wire.BlockHeader{}, uint32(0), nil,
-				)
-				bHS.On("FetchHeaderByHeight", uint32(0)).Return(
-					bH.BlockHeader.BlockHeader, nil,
+					&wire.BlockHeader{},
+					uint32(len(blockHdrs)-1), nil,
 				)
 
-				// Mock target filter header store.
-				fHS := &headerfs.MockFilterHeaderStore{}
-				fHS.On("ChainTip").Return(
-					&chainhash.Hash{}, uint32(0), nil,
-				)
+				// Mock import and target block header sources
+				// on block headers while making sure there are
+				// overlap headers.
+				numBlockHeaders := len(blockHdrs)
+				for i := range numBlockHeaders {
+					height := uint32(i)
+					blockHeader := blockHdrs[i]
+					bH, err := constructBlkHdr(
+						blockHeader, height,
+					)
+					if err != nil {
+						return Prep{err: err}
+					}
 
-				// Configure Import options.
-				ops := &ImportOptions{
-					TargetBlockHeaderStore:  bHS,
-					TargetFilterHeaderStore: fHS,
+					bHS.On(
+						"FetchHeaderByHeight", height,
+					).Return(
+						bH.BlockHeader.BlockHeader,
+						nil,
+					).Once()
+
+					// Deliberately and trivially malform
+					// the block header at the mid point to
+					// evaluate the validation behavior.
+					if i == numBlockHeaders/2 {
+						bIS.On(
+							"GetHeader", height,
+						).Return(
+							NewBlockHeader(), nil,
+						).Once()
+					} else {
+						bIS.On(
+							"GetHeader", height,
+						).Return(bH, nil).Once()
+					}
 				}
 
-				h := &HeadersImport{
-					BlockHeadersImportSource: bIS,
-					options:                  ops,
-				}
-
-				return Prep{
-					hImport: h,
-				}
-			},
-			expectErr: true,
-			expectErrMsg: "genesis header mismatch: block header " +
-				"mismatch at height 0",
-		},
-		{
-			name: "ErrorOnGenesisFilterHeadersMismatch",
-			prep: func() Prep {
-				// Prep block header for testing.
-				bH, err := constructBlkHdr(
-					blockHdrs[0], uint32(0),
-				)
-				if err != nil {
-					return Prep{err: err}
-				}
-
-				// Prep filter header for testing.
-				fH, err := constructFilterHdr(
-					filterHdrs[0], uint32(0),
-				)
-				if err != nil {
-					return Prep{err: err}
-				}
-
-				// Mock block import source.
-				bIS := &mockHeaderImportSource{}
-				bIS.On("GetHeaderMetadata").Return(
-					&HeaderMetadata{}, nil,
-				)
-				bIS.On("GetHeader", uint32(0)).Return(bH, nil)
-
-				// Mock target block header store.
-				bHS := &headerfs.MockBlockHeaderStore{}
-				bHS.On("ChainTip").Return(
-					&wire.BlockHeader{}, uint32(0), nil,
-				)
-				bHS.On("FetchHeaderByHeight", uint32(0)).Return(
-					bH.BlockHeader.BlockHeader, nil,
-				)
-
-				// Mock target filter header store.
-				fHS := &headerfs.MockFilterHeaderStore{}
-				fHS.On("ChainTip").Return(
-					&chainhash.Hash{}, uint32(0), nil,
-				)
-				fHS.On("FetchHeaderByHeight", uint32(0)).Return(
-					&fH.FilterHash, nil,
-				)
-
-				// Mock import filter header store.
+				// Mock filter header import source.
 				fIS := &mockHeaderImportSource{}
-				fIS.On("GetHeaderMetadata").Return(
-					&HeaderMetadata{}, nil,
+
+				// Mock target filter header store.
+				fHS := &headerfs.MockFilterHeaderStore{}
+				fHS.On("ChainTip").Return(
+					&chainhash.Hash{},
+					uint32(len(filterHdrs)-1), nil,
 				)
-				fIS.On("GetHeader", uint32(0)).Return(
-					NewFilterHeader(), nil,
-				)
+
+				// Mock import and target filter header sources
+				// on filter headerswhile making sure there are
+				// overlap headers.
+				numFilterHeaders := len(filterHdrs)
+				for i := range numFilterHeaders {
+					height := uint32(i)
+					filterHeader := filterHdrs[i]
+					fH, err := constructFilterHdr(
+						filterHeader, height,
+					)
+					if err != nil {
+						return Prep{err: err}
+					}
+
+					fHS.On(
+						"FetchHeaderByHeight", height,
+					).Return(&fH.FilterHash, nil).Once()
+
+					fIS.On(
+						"GetHeader", height,
+					).Return(fH, nil).Once()
+				}
 
 				// Configure Import options.
 				ops := &ImportOptions{
@@ -7569,9 +8224,115 @@ func TestImportAndTargetSourcesChainContinuityConstraint(t *testing.T) {
 					hImport: h,
 				}
 			},
-			expectErr: true,
-			expectErrMsg: "genesis header mismatch: filter " +
-				"header mismatch at height 0",
+			expectErr:    true,
+			expectErrMsg: "block header mismatch at height 2",
+		},
+		{
+			name: "ErrorOnMiddleFilterHeadersMismatch",
+			prep: func() Prep {
+				// Mock block import source.
+				hM := &HeaderMetadata{
+					StartHeight: 0,
+					EndHeight:   uint32(len(blockHdrs) - 1),
+				}
+				bIS := &mockHeaderImportSource{}
+				bIS.On("GetHeaderMetadata").Return(hM, nil)
+
+				// Mock target block header store.
+				bHS := &headerfs.MockBlockHeaderStore{}
+				bHS.On("ChainTip").Return(
+					&wire.BlockHeader{},
+					uint32(len(blockHdrs)-1), nil,
+				)
+
+				// Mock import and target block header sources
+				// on block headers while making sure there are
+				// overlap headers.
+				numBlockHeaders := len(blockHdrs)
+				for i := range numBlockHeaders {
+					height := uint32(i)
+					blockHeader := blockHdrs[i]
+					bH, err := constructBlkHdr(
+						blockHeader, height,
+					)
+					if err != nil {
+						return Prep{err: err}
+					}
+
+					bIS.On("GetHeader", height).Return(
+						bH, nil,
+					).Once()
+
+					bHS.On(
+						"FetchHeaderByHeight", height,
+					).Return(
+						bH.BlockHeader.BlockHeader,
+						nil,
+					).Once()
+				}
+
+				// Mock filter header import source.
+				fIS := &mockHeaderImportSource{}
+
+				// Mock target filter header store.
+				fHS := &headerfs.MockFilterHeaderStore{}
+				fHS.On("ChainTip").Return(
+					&chainhash.Hash{},
+					uint32(len(filterHdrs)-1), nil,
+				)
+
+				// Mock import and target filter header sources
+				// on filter headerswhile making sure there are
+				// overlap headers.
+				numFilterHeaders := len(filterHdrs)
+				for i := range numFilterHeaders {
+					height := uint32(i)
+					filterHeader := filterHdrs[i]
+					fH, err := constructFilterHdr(
+						filterHeader, height,
+					)
+					if err != nil {
+						return Prep{err: err}
+					}
+
+					fHS.On(
+						"FetchHeaderByHeight", height,
+					).Return(&fH.FilterHash, nil).Once()
+
+					// Deliberately and trivially malform
+					// the filter header at the mid point to
+					// evaluate the validation behavior.
+					if i == numFilterHeaders/2 {
+						fIS.On(
+							"GetHeader", height,
+						).Return(
+							NewFilterHeader(), nil,
+						).Once()
+					} else {
+						fIS.On(
+							"GetHeader", height,
+						).Return(fH, nil).Once()
+					}
+				}
+
+				// Configure Import options.
+				ops := &ImportOptions{
+					TargetBlockHeaderStore:  bHS,
+					TargetFilterHeaderStore: fHS,
+				}
+
+				h := &HeadersImport{
+					BlockHeadersImportSource:  bIS,
+					FilterHeadersImportSource: fIS,
+					options:                   ops,
+				}
+
+				return Prep{
+					hImport: h,
+				}
+			},
+			expectErr:    true,
+			expectErrMsg: "filter header mismatch at height 2",
 		},
 		{
 			name: "ValidateOnGenesisHeightSuccessfully",
